@@ -1,0 +1,12 @@
+data/
+experiments/*/checkpoints/
+*.pt
+*.pth
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.DS_Store
+outputs/figures/*.png
+outputs/tables/*.csv
+ProtoCXR_Agent_Prompt.py
