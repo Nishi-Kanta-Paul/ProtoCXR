@@ -1,32 +1,21 @@
-"""
-src/train.py
-============
-Complete 4-phase training loop for ProtoCXR:
+"""Training loops for ProtoCXR."""
 
-  Phase 1 — Warm-up        : Only prototype layer + FC trained.
-  Phase 2 — Joint Training  : All layers trained with differential LRs.
-  Phase 3 — Prototype Push  : Periodically replace prototypes with real patches.
-  Phase 4 — FC Fine-tuning  : Only the final FC layer trained.
-"""
-
-import datetime
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from copy import deepcopy
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.config import Config
 from src.losses import ProtoCXRLoss
-from src.model import LungMaskNet, ProtoCXR
+from src.model import ProtoCXR
 from src.utils import AverageMeter, append_jsonl, save_json, set_seed
 
-
-# ─── Single Epoch ─────────────────────────────────────────────────────────────
 
 def train_one_epoch(
     model: ProtoCXR,
@@ -37,60 +26,51 @@ def train_one_epoch(
     epoch: int,
     config: Config,
 ) -> Dict[str, float]:
-    """Train the model for a single epoch.
-
-    Runs forward/backward passes for every mini-batch in ``loader``,
-    clips gradients, updates parameters, and tracks losses via
-    :class:`~src.utils.AverageMeter`.
+    """Train ProtoCXR for one epoch.
 
     Args:
-        model:     :class:`~src.model.ProtoCXR` model in training mode.
-        loader:    Training :class:`~torch.utils.data.DataLoader`.
-        optimizer: PyTorch optimizer.
-        loss_fn:   :class:`~src.losses.ProtoCXRLoss` composite loss.
-        device:    Compute device.
-        epoch:     Current epoch number (1-indexed, for display).
-        config:    ``Config`` instance (reads ``GRAD_CLIP``).
+        model: ProtoCXR model in training mode.
+        loader: Training dataloader.
+        optimizer: Optimizer for the current phase.
+        loss_fn: Combined ProtoCXR loss module.
+        device: Target device.
+        epoch: Current epoch number (1-indexed).
+        config: Global configuration.
 
     Returns:
-        Dictionary mapping loss component names to their epoch-average
-        float values: ``{"total", "bce", "ara", "pdr", "sep"}``.
-    """
-    model.train()
-    meters = {k: AverageMeter() for k in ("total", "bce", "ara", "pdr", "sep")}
+        Dictionary containing averaged values for total, bce, ara, pdr, sep.
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False, dynamic_ncols=True)
-    for images, labels in pbar:
+    Raises:
+        None.
+    """
+
+    model.train()
+    meters = {name: AverageMeter() for name in ["total", "bce", "ara", "pdr", "sep"]}
+    progress = tqdm(loader, leave=False)
+
+    for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-
-        logits, sim_maps, _ = model(images, return_sim_maps=True)  # type: ignore[misc]
-        loss_dict = loss_fn(
-            logits, labels, sim_maps, images, model.prototypes
-        )
-
+        optimizer.zero_grad(set_to_none=True)
+        logits, sim_maps, _ = model(images, return_sim_maps=True)
+        loss_dict = loss_fn(logits, labels, sim_maps, images, model.prototypes)
         loss_dict["total"].backward()
+
         torch.nn.utils.clip_grad_norm_(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            max_norm=config.GRAD_CLIP,
+            [param for param in model.parameters() if param.requires_grad],
+            config.GRAD_CLIP,
         )
         optimizer.step()
 
-        bsz = images.size(0)
-        for k, meter in meters.items():
-            meter.update(loss_dict[k].item(), n=bsz)
+        batch_size = images.shape[0]
+        for key in meters:
+            meters[key].update(float(loss_dict[key].item()), n=batch_size)
 
-        pbar.set_postfix(
-            loss=f"{meters['total'].avg:.4f}",
-            bce=f"{meters['bce'].avg:.4f}",
-        )
+        progress.set_description(f"Epoch {epoch} | Loss: {meters['total'].avg:.4f}")
 
-    return {k: m.avg for k, m in meters.items()}
+    return {key: meter.avg for key, meter in meters.items()}
 
-
-# ─── Validation ───────────────────────────────────────────────────────────────
 
 def validate(
     model: ProtoCXR,
@@ -98,53 +78,133 @@ def validate(
     loss_fn: ProtoCXRLoss,
     device: torch.device,
 ) -> Tuple[float, float]:
-    """Evaluate the model on a validation or test set.
-
-    Collects all logits and labels over the full loader, computes
-    per-sample BCE loss, and macro-averaged ROC-AUC.
+    """Validate ProtoCXR with loss and macro AUC.
 
     Args:
-        model:    :class:`~src.model.ProtoCXR` model.
-        loader:   Validation :class:`~torch.utils.data.DataLoader`.
-        loss_fn:  :class:`~src.losses.ProtoCXRLoss` for loss computation.
-        device:   Compute device.
+        model: ProtoCXR model.
+        loader: Validation dataloader.
+        loss_fn: Combined ProtoCXR loss module.
+        device: Target device.
 
     Returns:
-        Tuple ``(avg_val_loss, mean_auc)``:
-          - ``avg_val_loss`` (float): Mean total loss over the loader.
-          - ``mean_auc`` (float): Macro-averaged ROC-AUC score.
+        Tuple of (average validation loss, macro mean AUC).
+
+    Raises:
+        None.
     """
+
     model.eval()
-    all_logits: List[torch.Tensor] = []
+    loss_meter = AverageMeter()
+    all_probs: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
-    total_loss = AverageMeter()
 
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            logits, sim_maps, _ = model(images, return_sim_maps=True)  # type: ignore[misc]
-            loss_dict = loss_fn(
-                logits, labels, sim_maps, images, model.prototypes
-            )
-            total_loss.update(loss_dict["total"].item(), n=images.size(0))
+            logits, sim_maps, _ = model(images, return_sim_maps=True)
+            losses = loss_fn(logits, labels, sim_maps, images, model.prototypes)
+            loss_meter.update(float(losses["total"].item()), n=images.shape[0])
 
-            all_logits.append(torch.sigmoid(logits).cpu())
+            all_probs.append(torch.sigmoid(logits).cpu())
             all_labels.append(labels.cpu())
 
-    preds  = torch.cat(all_logits, dim=0).numpy()
-    targets = torch.cat(all_labels, dim=0).numpy()
-
+    probs = torch.cat(all_probs, dim=0).numpy()
+    labels_np = torch.cat(all_labels, dim=0).numpy()
     try:
-        mean_auc = roc_auc_score(targets, preds, average="macro")
+        mean_auc = float(roc_auc_score(labels_np, probs, average="macro"))
     except ValueError:
         mean_auc = float("nan")
 
-    return total_loss.avg, float(mean_auc)
+    return loss_meter.avg, mean_auc
 
 
-# ─── Main Training Function ───────────────────────────────────────────────────
+def _build_optimizer_for_phase(
+    model: ProtoCXR,
+    config: Config,
+    phase: str,
+) -> torch.optim.Optimizer:
+    """Create optimizer matching the current training phase.
+
+    Args:
+        model: ProtoCXR model.
+        config: Global config.
+        phase: One of warmup, joint, finetune.
+
+    Returns:
+        Configured AdamW optimizer.
+
+    Raises:
+        ValueError: If phase name is unknown.
+    """
+
+    if phase == "warmup":
+        params = [
+            {"params": [model.prototypes], "lr": config.LR_PROTO, "name": "proto"},
+            {"params": model.fc.parameters(), "lr": config.LR_FC, "name": "fc"},
+        ]
+    elif phase == "joint":
+        params = [
+            {"params": model.backbone.parameters(), "lr": config.LR_BACKBONE, "name": "backbone"},
+            {"params": model.proj.parameters(), "lr": config.LR_BACKBONE, "name": "backbone"},
+            {"params": [model.prototypes], "lr": config.LR_PROTO, "name": "proto"},
+            {"params": model.fc.parameters(), "lr": config.LR_FC, "name": "fc"},
+        ]
+    elif phase == "finetune":
+        params = [
+            {"params": model.fc.parameters(), "lr": config.LR_FC, "name": "fc"},
+        ]
+    else:
+        raise ValueError(f"Unknown phase: {phase}")
+
+    return torch.optim.AdamW(params, weight_decay=config.WEIGHT_DECAY)
+
+
+def _extract_lr(optimizer: torch.optim.Optimizer) -> Tuple[float, float]:
+    """Extract backbone and prototype learning rates from optimizer.
+
+    Args:
+        optimizer: Active optimizer.
+
+    Returns:
+        Tuple of (lr_backbone, lr_proto).
+
+    Raises:
+        None.
+    """
+
+    lr_backbone = 0.0
+    lr_proto = 0.0
+    for group in optimizer.param_groups:
+        group_name = group.get("name", "")
+        if group_name == "backbone":
+            lr_backbone = float(group["lr"])
+        if group_name == "proto":
+            lr_proto = float(group["lr"])
+    return lr_backbone, lr_proto
+
+
+def _print_phase_banner(index: int, name: str, start_epoch: int, end_epoch: int) -> None:
+    """Print standardized phase transition banner.
+
+    Args:
+        index: Phase number.
+        name: Phase name.
+        start_epoch: Start epoch index.
+        end_epoch: End epoch index.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+    """
+
+    print("=" * 60)
+    print(f"Phase {index}: {name} - epochs {start_epoch}-{end_epoch}")
+    print("=" * 60)
+
 
 def train(
     config: Config,
@@ -153,329 +213,284 @@ def train(
     experiment_dir: str,
     seed: int,
     skip_push: bool = False,
-) -> Tuple[ProtoCXR, Dict[str, List]]:
-    """Run the full 4-phase ProtoCXR training for a single seed.
-
-    Phases:
-        1. **Warm-up** (epochs 1 – ``WARMUP_EPOCHS``):
-           Backbone frozen; prototype layer + FC trained.
-        2. **Joint Training** (epochs ``WARMUP_EPOCHS+1`` – ``WARMUP_EPOCHS+JOINT_EPOCHS``):
-           All layers trained with differential learning rates.
-        3. **Prototype Push** (every ``PUSH_EVERY`` epochs within Phase 2):
-           Prototypes replaced with nearest real training patches.
-        4. **FC Fine-tuning** (last ``FINETUNE_EPOCHS`` epochs):
-           Backbone and prototypes frozen; only FC weights trained.
-
-    Logging:
-        - Appends one JSON line per epoch to
-          ``<experiment_dir>/logs/train_log_seed<seed>.jsonl``.
-        - Saves best checkpoint to
-          ``<experiment_dir>/checkpoints/best_model_seed<seed>.pt``
-          whenever validation AUC improves.
+) -> Tuple[ProtoCXR, Dict[str, List[float]]]:
+    """Run the full four-phase ProtoCXR training for one seed.
 
     Args:
-        config:         ``Config`` instance.
-        train_loader:   Training DataLoader.
-        val_loader:     Validation DataLoader.
-        experiment_dir: Root directory for checkpoints and logs.
-        seed:           Random seed (used for filenames and reproducibility).
-        skip_push:      If ``True``, skip prototype push (ablation variant).
+        config: Global config.
+        train_loader: Training dataloader.
+        val_loader: Validation dataloader.
+        experiment_dir: Path where logs/checkpoints are stored.
+        seed: Random seed for this run.
+        skip_push: If True, skips prototype push during joint phase.
 
     Returns:
-        Tuple ``(best_model, history)`` where:
-          - ``best_model`` is the :class:`~src.model.ProtoCXR` instance
-            loaded with best-validation-AUC weights.
-          - ``history`` is a dict with lists ``"train_loss"``, ``"val_loss"``,
-            ``"val_auc"`` indexed by epoch.
+        Tuple of (best_model, history_dict).
+
+    Raises:
+        RuntimeError: If no checkpoint is produced.
     """
+
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Build model + loss ────────────────────────────────────────────────────
-    model = ProtoCXR(
-        num_classes=config.NUM_CLASSES,
-        num_proto=config.NUM_PROTO,
-        feat_dim=config.FEAT_DIM,
-        backbone_name=config.BACKBONE,
-        backbone_pretrained=config.BACKBONE_PRETRAINED,
-        sim_epsilon=config.SIM_EPSILON,
-    ).to(device)
+    checkpoints_dir = os.path.join(experiment_dir, "checkpoints")
+    logs_dir = os.path.join(experiment_dir, "logs")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
 
-    loss_fn = ProtoCXRLoss(
-        lung_net=model.lung_net,
-        lambda_ara=config.LAMBDA_ARA,
-        lambda_pdr=config.LAMBDA_PDR,
-        lambda_sep=config.LAMBDA_SEP,
-        sigma=config.PDR_SIGMA,
-        num_classes=config.NUM_CLASSES,
-        num_proto=config.NUM_PROTO,
-    )
+    ckpt_path = os.path.join(checkpoints_dir, f"best_model_seed{seed}.pt")
+    log_path = os.path.join(logs_dir, f"train_log_seed{seed}.jsonl")
+    if os.path.exists(log_path):
+        os.remove(log_path)
 
-    # ── Paths ─────────────────────────────────────────────────────────────────
-    ckpt_dir = os.path.join(experiment_dir, "checkpoints")
-    log_dir  = os.path.join(experiment_dir, "logs")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(log_dir,  exist_ok=True)
+    model = ProtoCXR(config).to(device)
+    loss_fn = ProtoCXRLoss(model.lung_net, config)
 
-    best_ckpt_path = os.path.join(ckpt_dir, f"best_model_seed{seed}.pt")
-    log_path       = os.path.join(log_dir,   f"train_log_seed{seed}.jsonl")
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_auc": [],
+        "loss_bce": [],
+        "loss_ara": [],
+        "loss_pdr": [],
+        "loss_sep": [],
+    }
 
-    # ── History ───────────────────────────────────────────────────────────────
-    history: Dict[str, List] = {"train_loss": [], "val_loss": [], "val_auc": []}
-    best_val_auc = float("-inf")
-    best_model_state: Optional[Dict] = None
+    best_auc = float("-inf")
+    best_state: Dict[str, torch.Tensor] = {}
 
-    # ── Phase boundaries ──────────────────────────────────────────────────────
-    p1_end = config.WARMUP_EPOCHS
-    p2_end = config.WARMUP_EPOCHS + config.JOINT_EPOCHS
-    p4_end = p2_end + config.FINETUNE_EPOCHS   # == TOTAL_EPOCHS
+    warm_start, warm_end = 1, config.WARMUP_EPOCHS
+    joint_start, joint_end = warm_end + 1, warm_end + config.JOINT_EPOCHS
+    fine_start, fine_end = joint_end + 1, joint_end + config.FINETUNE_EPOCHS
 
-    # ========================================================================
-    # Phase 1 — Warm-up
-    # ========================================================================
-    print(f"\n{'═' * 60}")
-    print(f"  Phase 1: Warm-up — epochs 1–{p1_end} | seed {seed}")
-    print(f"{'═' * 60}")
+    # Phase 1: Warm-up
+    _print_phase_banner(1, "Warm-up", warm_start, warm_end)
+    model.freeze_backbone(True)
+    model.freeze_prototypes(False)
+    optimizer = _build_optimizer_for_phase(model, config, phase="warmup")
 
-    model.freeze_backbone(freeze=True)
-    model.freeze_prototypes(freeze=False)
-
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": model.prototypes, "lr": config.LR_PROTO},
-            {"params": model.fc.parameters(), "lr": config.LR_FC},
-        ],
-        weight_decay=config.WEIGHT_DECAY,
-    )
-
-    for epoch in range(1, p1_end + 1):
-        train_losses = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, epoch, config
-        )
+    for epoch in range(warm_start, warm_end + 1):
+        train_losses = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config)
         val_loss, val_auc = validate(model, val_loader, loss_fn, device)
-        _log_and_checkpoint(
-            epoch, train_losses, val_loss, val_auc, optimizer,
-            "warmup", log_path, best_ckpt_path, model,
-            history, best_val_auc,
+        lr_backbone, lr_proto = _extract_lr(optimizer)
+
+        history["train_loss"].append(train_losses["total"])
+        history["val_loss"].append(val_loss)
+        history["val_auc"].append(val_auc)
+        history["loss_bce"].append(train_losses["bce"])
+        history["loss_ara"].append(train_losses["ara"])
+        history["loss_pdr"].append(train_losses["pdr"])
+        history["loss_sep"].append(train_losses["sep"])
+
+        append_jsonl(
+            {
+                "epoch": epoch,
+                "phase": "warmup",
+                "train_loss": train_losses["total"],
+                "val_loss": val_loss,
+                "val_auc": val_auc,
+                "loss_bce": train_losses["bce"],
+                "loss_ara": train_losses["ara"],
+                "loss_pdr": train_losses["pdr"],
+                "loss_sep": train_losses["sep"],
+                "lr_backbone": lr_backbone,
+                "lr_proto": lr_proto,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            log_path,
         )
-        best_val_auc, best_model_state = _update_best(
-            val_auc, best_val_auc, model, optimizer, epoch, best_ckpt_path
-        )
 
-    # ========================================================================
-    # Phase 2 — Joint Training  +  Phase 3 — Prototype Push
-    # ========================================================================
-    print(f"\n{'═' * 60}")
-    print(f"  Phase 2: Joint Training — epochs {p1_end + 1}–{p2_end} | seed {seed}")
-    print(f"{'═' * 60}")
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_state = deepcopy(model.state_dict())
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "val_auc": val_auc,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "config": vars(config),
+                },
+                ckpt_path,
+            )
 
-    model.freeze_backbone(freeze=False)
-    model.freeze_prototypes(freeze=False)
+    # Phase 2 + push
+    _print_phase_banner(2, "Joint Training", joint_start, joint_end)
+    model.freeze_backbone(False)
+    model.freeze_prototypes(False)
+    optimizer = _build_optimizer_for_phase(model, config, phase="joint")
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": model.backbone.parameters(), "lr": config.LR_BACKBONE},
-            {"params": model.proj.parameters(),     "lr": config.LR_BACKBONE},
-            {"params": model.prototypes,            "lr": config.LR_PROTO},
-            {"params": model.fc.parameters(),       "lr": config.LR_FC},
-        ],
-        weight_decay=config.WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.JOINT_EPOCHS
-    )
-
-    for epoch in range(p1_end + 1, p2_end + 1):
-        train_losses = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, epoch, config
-        )
+    for epoch in range(joint_start, joint_end + 1):
+        train_losses = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config)
         val_loss, val_auc = validate(model, val_loader, loss_fn, device)
-        _log_and_checkpoint(
-            epoch, train_losses, val_loss, val_auc, optimizer,
-            "joint", log_path, best_ckpt_path, model,
-            history, best_val_auc,
-        )
-        best_val_auc, best_model_state = _update_best(
-            val_auc, best_val_auc, model, optimizer, epoch, best_ckpt_path
-        )
-        scheduler.step()
 
-        # Phase 3 — Prototype Push every PUSH_EVERY epochs
-        relative_epoch = epoch - p1_end
-        if not skip_push and relative_epoch % config.PUSH_EVERY == 0:
-            print(f"  → Prototype push at epoch {epoch} …")
+        if not skip_push and epoch % config.PUSH_EVERY == 0:
             model.push_prototypes(train_loader, device)
 
-    # ========================================================================
-    # Phase 4 — FC Fine-tuning
-    # ========================================================================
-    print(f"\n{'═' * 60}")
-    print(f"  Phase 4: FC Fine-tuning — epochs {p2_end + 1}–{p4_end} | seed {seed}")
-    print(f"{'═' * 60}")
+        lr_backbone, lr_proto = _extract_lr(optimizer)
+        history["train_loss"].append(train_losses["total"])
+        history["val_loss"].append(val_loss)
+        history["val_auc"].append(val_auc)
+        history["loss_bce"].append(train_losses["bce"])
+        history["loss_ara"].append(train_losses["ara"])
+        history["loss_pdr"].append(train_losses["pdr"])
+        history["loss_sep"].append(train_losses["sep"])
 
-    model.freeze_backbone(freeze=True)
-    model.freeze_prototypes(freeze=True)
-
-    optimizer = torch.optim.AdamW(
-        model.fc.parameters(),
-        lr=config.LR_FC,
-        weight_decay=config.WEIGHT_DECAY,
-    )
-
-    for epoch in range(p2_end + 1, p4_end + 1):
-        train_losses = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, epoch, config
+        append_jsonl(
+            {
+                "epoch": epoch,
+                "phase": "joint",
+                "train_loss": train_losses["total"],
+                "val_loss": val_loss,
+                "val_auc": val_auc,
+                "loss_bce": train_losses["bce"],
+                "loss_ara": train_losses["ara"],
+                "loss_pdr": train_losses["pdr"],
+                "loss_sep": train_losses["sep"],
+                "lr_backbone": lr_backbone,
+                "lr_proto": lr_proto,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            log_path,
         )
+
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_state = deepcopy(model.state_dict())
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "val_auc": val_auc,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "config": vars(config),
+                },
+                ckpt_path,
+            )
+
+    # Phase 4: FC fine-tuning
+    _print_phase_banner(4, "FC Fine-tune", fine_start, fine_end)
+    model.freeze_backbone(True)
+    model.freeze_prototypes(True)
+    optimizer = _build_optimizer_for_phase(model, config, phase="finetune")
+
+    for epoch in range(fine_start, fine_end + 1):
+        train_losses = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config)
         val_loss, val_auc = validate(model, val_loader, loss_fn, device)
-        _log_and_checkpoint(
-            epoch, train_losses, val_loss, val_auc, optimizer,
-            "finetune", log_path, best_ckpt_path, model,
-            history, best_val_auc,
-        )
-        best_val_auc, best_model_state = _update_best(
-            val_auc, best_val_auc, model, optimizer, epoch, best_ckpt_path
+        lr_backbone, lr_proto = _extract_lr(optimizer)
+
+        history["train_loss"].append(train_losses["total"])
+        history["val_loss"].append(val_loss)
+        history["val_auc"].append(val_auc)
+        history["loss_bce"].append(train_losses["bce"])
+        history["loss_ara"].append(train_losses["ara"])
+        history["loss_pdr"].append(train_losses["pdr"])
+        history["loss_sep"].append(train_losses["sep"])
+
+        append_jsonl(
+            {
+                "epoch": epoch,
+                "phase": "finetune",
+                "train_loss": train_losses["total"],
+                "val_loss": val_loss,
+                "val_auc": val_auc,
+                "loss_bce": train_losses["bce"],
+                "loss_ara": train_losses["ara"],
+                "loss_pdr": train_losses["pdr"],
+                "loss_sep": train_losses["sep"],
+                "lr_backbone": lr_backbone,
+                "lr_proto": lr_proto,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            log_path,
         )
 
-    # ── Load best checkpoint ─────────────────────────────────────────────────
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_state = deepcopy(model.state_dict())
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "val_auc": val_auc,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "config": vars(config),
+                },
+                ckpt_path,
+            )
 
-    print(f"\n  Training complete — Best val AUC: {best_val_auc:.4f}")
+    if not best_state:
+        raise RuntimeError("No best checkpoint state was captured during training.")
+
+    model.load_state_dict(best_state)
     return model, history
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _log_and_checkpoint(
-    epoch: int,
-    train_losses: Dict[str, float],
-    val_loss: float,
-    val_auc: float,
-    optimizer: torch.optim.Optimizer,
-    phase: str,
-    log_path: str,
-    ckpt_path: str,
-    model: ProtoCXR,
-    history: Dict[str, List],
-    best_val_auc: float,
-) -> None:
-    """Append one JSON-L log line and print epoch summary.
+def _evaluate_test_auc(model: ProtoCXR, loader: DataLoader, device: torch.device) -> float:
+    """Compute macro ROC-AUC on test loader.
 
     Args:
-        epoch:         Current epoch number.
-        train_losses:  Dict returned by :func:`train_one_epoch`.
-        val_loss:      Validation total loss.
-        val_auc:       Validation macro-AUC.
-        optimizer:     Current optimizer (for LR extraction).
-        phase:         Phase name string for the log record.
-        log_path:      Path to the ``.jsonl`` log file.
-        ckpt_path:     Path to the best checkpoint file.
-        model:         Model instance.
-        history:       Mutable history dict updated in-place.
-        best_val_auc:  Current best AUC (for log purposes).
-    """
-    history["train_loss"].append(train_losses["total"])
-    history["val_loss"].append(val_loss)
-    history["val_auc"].append(val_auc)
-
-    lr = optimizer.param_groups[0]["lr"]
-    record = {
-        "epoch":      epoch,
-        "train_loss": round(train_losses["total"], 6),
-        "val_loss":   round(val_loss, 6),
-        "val_auc":    round(val_auc, 6),
-        "bce":        round(train_losses["bce"], 6),
-        "ara":        round(train_losses["ara"], 6),
-        "pdr":        round(train_losses["pdr"], 6),
-        "sep":        round(train_losses["sep"], 6),
-        "lr":         lr,
-        "phase":      phase,
-        "timestamp":  datetime.datetime.utcnow().isoformat() + "Z",
-    }
-    append_jsonl(record, log_path)
-
-    star = " ★" if val_auc > best_val_auc else ""
-    print(
-        f"  [Epoch {epoch:3d}] train_loss={train_losses['total']:.4f} "
-        f"val_loss={val_loss:.4f}  val_auc={val_auc:.4f}{star}"
-    )
-
-
-def _update_best(
-    val_auc: float,
-    best_val_auc: float,
-    model: ProtoCXR,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    ckpt_path: str,
-) -> Tuple[float, Optional[Dict]]:
-    """Save checkpoint if current AUC is best so far.
-
-    Args:
-        val_auc:      Current epoch's validation AUC.
-        best_val_auc: Previous best AUC.
-        model:        Model to checkpoint.
-        optimizer:    Optimizer state to save.
-        epoch:        Current epoch number.
-        ckpt_path:    Destination file path.
+        model: Trained model in eval mode.
+        loader: Test dataloader.
+        device: Active device.
 
     Returns:
-        Tuple ``(new_best_auc, model_state_dict)`` where
-        ``model_state_dict`` is the saved state (or ``None`` if not improved).
+        Macro ROC-AUC value.
+
+    Raises:
+        None.
     """
-    if val_auc > best_val_auc:
-        state = model.state_dict()
-        torch.save(
-            {
-                "epoch":             epoch,
-                "model_state_dict":  state,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_auc":           val_auc,
-            },
-            ckpt_path,
-        )
-        return val_auc, dict(state)
-    return best_val_auc, None
 
+    model.eval()
+    all_probs: List[torch.Tensor] = []
+    all_labels: List[torch.Tensor] = []
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            logits, _ = model(images, return_sim_maps=False)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.cpu())
+            all_labels.append(labels.cpu())
 
-# ─── Multi-Seed Runner ────────────────────────────────────────────────────────
+    probs_np = torch.cat(all_probs, dim=0).numpy()
+    labels_np = torch.cat(all_labels, dim=0).numpy()
+    try:
+        return float(roc_auc_score(labels_np, probs_np, average="macro"))
+    except ValueError:
+        return float("nan")
+
 
 def run_all_seeds(
     config: Config,
     train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader,
-    dataset_name: str,
     skip_push: bool = False,
-) -> Dict[int, Dict[str, Any]]:
-    """Train ProtoCXR across all configured seeds and aggregate results.
-
-    Each seed is trained independently with :func:`train`. The aggregated
-    mean / std AUC and a config snapshot are saved to
-    ``<EXPERIMENT_DIR>/results.json``.
+) -> Dict[str, object]:
+    """Train ProtoCXR over all configured seeds and save aggregate results.
 
     Args:
-        config:       ``Config`` instance.
-        train_loader: Training DataLoader.
-        val_loader:   Validation DataLoader.
-        test_loader:  Test DataLoader (not used in this function but
-                      reserved for the caller to run :func:`~src.evaluate.compute_mean_auc`).
-        dataset_name: ``"chexpert"`` or ``"nih"``.
-        skip_push:    If ``True``, skip prototype push in all seeds.
+        config: Global config.
+        train_loader: Training dataloader.
+        val_loader: Validation dataloader.
+        test_loader: Test dataloader.
+        skip_push: Whether to disable prototype push.
 
     Returns:
-        Dictionary ``{seed: {"val_auc": float, "history": dict}}`` for all
-        seeds in ``config.SEEDS``.
+        Aggregated result dict saved to results.json.
+
+    Raises:
+        None.
     """
-    all_results: Dict[int, Dict[str, Any]] = {}
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    per_seed_auc: Dict[str, float] = {}
+    best_seed = config.SEEDS[0]
+    best_auc = float("-inf")
 
     for seed in config.SEEDS:
-        print(f"\n{'═' * 70}")
-        print(f"  SEED {seed}  |  dataset: {dataset_name}")
-        print(f"{'═' * 70}")
-        set_seed(seed)
-
-        best_model, history = train(
+        model, _ = train(
             config=config,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -483,34 +498,23 @@ def run_all_seeds(
             seed=seed,
             skip_push=skip_push,
         )
+        seed_auc = _evaluate_test_auc(model, test_loader, device)
+        per_seed_auc[str(seed)] = seed_auc
+        if seed_auc > best_auc:
+            best_auc = seed_auc
+            best_seed = seed
 
-        final_val_auc = max(history["val_auc"]) if history["val_auc"] else float("nan")
-        all_results[seed] = {"val_auc": final_val_auc, "history": history}
-
-    # ── Aggregate ─────────────────────────────────────────────────────────────
-    aucs = [v["val_auc"] for v in all_results.values()]
-    mean_auc = float(np.mean(aucs))
-    std_auc  = float(np.std(aucs))
-
-    best_seed = max(all_results, key=lambda s: all_results[s]["val_auc"])
-
-    results_payload: Dict[str, Any] = {
-        "model_name":    "ProtoCXR",
-        "dataset":       dataset_name,
-        "mean_auc":      round(mean_auc, 6),
-        "std_auc":       round(std_auc, 6),
-        "per_seed_auc":  {str(s): round(v["val_auc"], 6) for s, v in all_results.items()},
-        "best_seed":     best_seed,
-        "config_snapshot": {
-            k: v for k, v in config.__dict__.items()
-            if not k.startswith("_")
-        },
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    auc_values = list(per_seed_auc.values())
+    results = {
+        "model_name": "ProtoCXR",
+        "dataset": "VinDr-CXR",
+        "mean_auc": float(np.mean(auc_values)),
+        "std_auc": float(np.std(auc_values)),
+        "per_seed_auc": per_seed_auc,
+        "best_seed": int(best_seed),
+        "config_snapshot": vars(config),
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
-    results_path = os.path.join(config.EXPERIMENT_DIR, "results.json")
-    save_json(results_payload, results_path)
-    print(f"\n  Results saved → {results_path}")
-    print(f"  Mean AUC: {mean_auc:.4f} ± {std_auc:.4f}")
-
-    return all_results
+    save_json(results, os.path.join(config.EXPERIMENT_DIR, "results.json"))
+    return results

@@ -5,8 +5,9 @@ experiments/*/checkpoints/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-*.egg-info/
-.DS_Store
 outputs/figures/*.png
 outputs/tables/*.csv
+*.egg-info/
+.DS_Store
+ProtoCXR_Agent_Prompt Updated.py
 ProtoCXR_Agent_Prompt.py

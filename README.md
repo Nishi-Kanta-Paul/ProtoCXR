@@ -1,91 +1,88 @@
 # ProtoCXR
 
-> **ProtoCXR**: Prototype-Based Interpretable Multi-Label Diagnosis from Chest X-Rays Using Visually Grounded Anatomical Concepts
+Prototype-Based Interpretable Multi-Label Diagnosis from Chest X-Rays Using Visually Grounded Anatomical Concepts.
 
 ## Overview
 
-ProtoCXR is a novel deep learning framework for interpretable multi-label classification of chest X-rays. Standard convolutional networks and vision transformers provide highly accurate diagnoses but lack interpretable rationales. Our approach bridges this gap by introducing an interpretable bottleneck layer based on *prototypes* — actual image patches from the training set. 
+ProtoCXR trains a DenseNet-121 feature extractor with class-wise prototypes for interpretable multi-label CXR diagnosis. The current implementation targets VinDr-CXR only.
 
-For every prediction, ProtoCXR explains its reasoning by dissecting the image and pointing out spatial locations that are visually similar to learned reference patches associated with specific lung pathologies.
+Supported labels:
 
-## Architecture
+1. Aortic enlargement
+2. Cardiomegaly
+3. Pleural effusion
+4. Pleural thickening
+5. Pulmonary fibrosis
+6. No finding
 
-1. **Backbone & Projection**: A truncated DenseNet-121 core extracts spatial feature maps, projected to a prototype embedding space.
-2. **Prototype Similarity Layer**: Replaces the global average pooling and dense classifier of standard networks. Compares the spatial features against $C \times K$ learned prototypes.
-3. **Anatomical Region Alignment (ARA)**: A lightweight frozen U-Net guides prototypes to focus strictly on lung regions, reducing spurious correlations.
-4. **Prototype Push**: During training, algorithmically replaces latent prototypes with the nearest latent representations of actual training image patches, creating highly interpretable diagnostic exemplars.
+## Dataset
 
-## Dataset Setup
+Dataset: VinDr-CXR (18,000 images)
 
-This codebase natively supports CheXpert v1.0-small and the NIH ChestX-ray14 datasets.
+Expected layout:
 
-1. **CheXpert**: Download `CheXpert-v1.0-small.zip` from Stanford ML Group and extract it to `data/CheXpert-v1.0-small/`.
-2. **NIH ChestX-ray14**: Download the `images/` directory and `Data_Entry_2017.csv` and place them in `data/NIH_ChestXray14/`.
-
-Your `data/` folder should look like:
 ```text
 data/
-├── CheXpert-v1.0-small/
-│   ├── train.csv
-│   └── train/
-└── NIH_ChestXray14/
-    ├── Data_Entry_2017.csv
-    └── images/
+└── vindr-cxr/
+    ├── train.csv
+    ├── test.csv
+    ├── train/
+    └── test/
 ```
 
-## Quick Start
+The loader supports both DICOM and PNG image files.
 
-You can run the entire training, ablation, and evaluation pipeline using our reproducible bash script.
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
 bash scripts/run_full_pipeline.sh
 ```
 
-## File Structure
+## Main Pipeline
 
-```text
-ProtoCXR/
-├── data/                          ← Datasets go here
-├── src/
-│   ├── config.py                  ← Central configuration and hyperparameters
-│   ├── dataset.py                 ← Data loading and stratified subset logic
-│   ├── model.py                   ← Main ProtoCXR architecture
-│   ├── losses.py                  ← ARA, PDR, and Separation constraints
-│   ├── train.py                   ← 4-phase prototype training loop
-│   ├── explainability.py          ← Visualization and patch matching logic
-│   ├── inference.py               ← Single-image and directory inference
-│   ├── evaluate.py                ← Table & metrics generation
-│   ├── figures.py                 ← Generates all paper figures
-│   └── main.py                    ← CLI entry point
-├── baselines/
-│   ├── train_densenet121.py       ← Black-box standard baseline
-│   ├── train_protopnet.py         ← ProtoPNet without ARA/PDR
-│   ├── train_cbm.py               ← Concept Bottleneck baseline
-│   └── compare_results.py         ← Compiles figures & tables from logs
-├── scripts/
-│   └── run_full_pipeline.sh       ← Execution script
-├── experiments/                   ← Checkpoints and training logs (auto-generated)
-└── outputs/                       ← Final figures and tables (auto-generated)
+```bash
+python src/main.py --ablation --figures --tables
 ```
 
-## Results Summary
+Optional inference:
 
-| Method | CheXpert (AUC) | NIH-CXR14 (AUC) | Interpretable |
-| :--- | :---: | :---: | :---: |
-| DenseNet-121 | 0.903 | 0.892 | No |
-| CBM | 0.851 | 0.836 | Yes |
-| ProtoPNet | 0.864 | 0.849 | Yes |
-| **ProtoCXR (ours)** | **0.891** | **0.879** | **Yes** |
+```bash
+python src/main.py --skip_train --inference_dir /path/to/images
+```
 
-*(Note: Above values are examples. Real values will populate in `outputs/tables/table1_auc.csv` after running the pipeline)*
+## Baselines
 
-## Citation
+```bash
+python baselines/train_densenet121.py
+python baselines/train_protopnet.py
+python baselines/train_cbm.py
+python baselines/compare_results.py
+```
 
-```bibtex
-@article{protocxr2026,
-  title={ProtoCXR: Prototype-Based Interpretable Multi-Label Diagnosis from Chest X-Rays Using Visually Grounded Anatomical Concepts},
-  author={Anonymous},
-  year={2026}
-}
+## Outputs
+
+Training artifacts:
+
+```text
+experiments/protocxr/
+├── checkpoints/best_model_seed{N}.pt
+├── logs/train_log_seed{N}.jsonl
+└── results.json
+```
+
+Publication artifacts:
+
+```text
+outputs/
+├── figures/
+│   ├── fig2_perfinding_auc.png
+│   ├── fig3_auc_comparison.png
+│   ├── fig4_ablation.png
+│   ├── fig5_user_study.png
+│   └── fig6_loss_curves.png
+└── tables/
+    ├── table1_auc.csv / table1_auc.txt
+    ├── table2_ablation.csv / table2_ablation.txt
+    └── table3_perfinding.csv / table3_perfinding.txt
 ```

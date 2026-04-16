@@ -1,14 +1,8 @@
-"""
-src/model.py
-============
-ProtoCXR model and all submodules:
-  - PrototypeSimilarity
-  - LungMaskNet
-  - ProtoCXR (main model)
-"""
+"""Model definitions for ProtoCXR."""
 
+import os
 import warnings
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import timm
 import torch
@@ -19,418 +13,345 @@ from torch.utils.data import DataLoader
 from src.config import Config
 
 
-# ─── Prototype Similarity ─────────────────────────────────────────────────────
-
 class PrototypeSimilarity(nn.Module):
-    """Compute log-similarity between spatial feature maps and prototypes.
-
-    Implements:
-        g(z, p) = log((||z - p||² + 1) / (||z - p||² + epsilon))
+    """Computes prototype similarity maps from spatial features.
 
     Args:
-        epsilon: Small constant for numerical stability.
+        epsilon: Numerical stability constant for denominator.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
     """
 
     def __init__(self, epsilon: float = 1e-4) -> None:
         super().__init__()
         self.epsilon = epsilon
 
-    def forward(
-        self,
-        features: torch.Tensor,
-        prototypes: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute per-prototype similarity maps.
+    def forward(self, features: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
+        """Compute similarity map g(z, p) at every spatial location.
 
         Args:
-            features:   ``(B, D, H, W)`` spatial feature maps.
-            prototypes: ``(P, D)`` prototype vectors.
+            features: Tensor shaped (B, D, H, W).
+            prototypes: Tensor shaped (P, D).
 
         Returns:
-            Similarity maps of shape ``(B, P, H, W)``.
+            Similarity tensor shaped (B, P, H, W).
+
+        Raises:
+            ValueError: If feature/prototype dimensions do not match.
         """
-        B, D, H, W = features.shape
-        P = prototypes.shape[0]
 
-        # Reshape features → (B, H*W, D)
-        f_flat = features.permute(0, 2, 3, 1).reshape(B, H * W, D)
+        if features.dim() != 4 or prototypes.dim() != 2:
+            raise ValueError("features must be (B,D,H,W) and prototypes must be (P,D).")
+        if features.shape[1] != prototypes.shape[1]:
+            raise ValueError("Feature channels and prototype dimensions must match.")
 
-        # Reshape prototypes → (1, P, D)
-        p = prototypes.unsqueeze(0)  # (1, P, D)
+        bsz, dim, height, width = features.shape
+        num_proto = prototypes.shape[0]
 
-        # ||z - p||² via broadcasting: (B, H*W, 1, D) - (1, 1, P, D)
-        f_exp = f_flat.unsqueeze(2)  # (B, H*W, 1, D)
-        p_exp = p.unsqueeze(0)       # (1, 1, P, D)
-
-        # Squared L2 distances: (B, H*W, P)
-        dist_sq = ((f_exp - p_exp) ** 2).sum(dim=-1)
-
-        # Log similarity: log((d² + 1) / (d² + ε))
+        patches = features.permute(0, 2, 3, 1).reshape(bsz, height * width, dim)
+        dist_sq = (patches.unsqueeze(2) - prototypes.unsqueeze(0).unsqueeze(0)).pow(2).sum(dim=-1)
         sim = torch.log((dist_sq + 1.0) / (dist_sq + self.epsilon))
-
-        # Reshape → (B, P, H, W)
-        sim = sim.permute(0, 2, 1).reshape(B, P, H, W)
+        sim = sim.permute(0, 2, 1).reshape(bsz, num_proto, height, width)
         return sim
 
 
-# ─── Lung Mask Network ────────────────────────────────────────────────────────
-
 class LungMaskNet(nn.Module):
-    """Lightweight U-Net for lung region segmentation.
-
-    Produces a binary (0/1) mask at 7×7 spatial resolution for use in
-    the Anatomical Region Alignment (ARA) loss.
-
-    Note:
-        In production, load pretrained weights from:
-        https://github.com/imlab-uiip/lung-segmentation-2d
-        If weights are not available, random initialization is used with
-        a printed warning.
+    """Frozen lightweight U-Net that outputs binary 7x7 lung masks.
 
     Args:
-        pretrained_path: Optional path to saved weight file (``.pth``).
-        threshold: Binarization threshold for the sigmoid output.
+        config: Global project config for loading pretrained lung weights.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
     """
 
-    def __init__(
-        self,
-        pretrained_path: Optional[str] = None,
-        threshold: float = 0.5,
-    ) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.threshold = threshold
 
-        # ── Encoder ──────────────────────────────────────────────────────────
-        self.enc1 = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
-        self.pool = nn.MaxPool2d(2, 2)
-
-        # ── Bottleneck ────────────────────────────────────────────────────────
-        self.bottleneck = nn.Sequential(
+        self.pool = nn.MaxPool2d(2)
+        self.bridge = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
-
-        # ── Decoder ──────────────────────────────────────────────────────────
-        self.dec1 = nn.Sequential(
+        self.decoder = nn.Sequential(
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 
-        if pretrained_path is not None:
-            try:
-                state = torch.load(pretrained_path, map_location="cpu")
-                self.load_state_dict(state, strict=False)
-                print(f"[LungMaskNet] Loaded pretrained weights from: {pretrained_path}")
-            except Exception as exc:
-                warnings.warn(
-                    f"[LungMaskNet] Could not load weights from '{pretrained_path}': {exc}. "
-                    "Using random initialization.",
-                    RuntimeWarning,
-                )
+        weight_path = os.path.join(config.DRIVE_ROOT, "lung_unet.pth")
+        if os.path.exists(weight_path):
+            state = torch.load(weight_path, map_location="cpu")
+            self.load_state_dict(state, strict=False)
         else:
-            print(
-                "[LungMaskNet] No pretrained weights provided.\n"
-                "  → For best results, download pretrained lung segmentation weights from:\n"
-                "    https://github.com/imlab-uiip/lung-segmentation-2d\n"
-                "  → Continuing with random initialization (ARA loss will still work but\n"
-                "    may not perfectly align prototypes to lung anatomy during warm-up)."
+            warnings.warn(
+                f"LungMaskNet weights not found at {weight_path}. Using random initialization.",
+                RuntimeWarning,
             )
 
-        # Freeze all parameters by default
         for param in self.parameters():
             param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute pixel-wise lung probability map.
+        """Run lung mask network forward pass.
 
         Args:
-            x: Input images of shape ``(B, 3, H, W)``.
+            x: Input image batch shaped (B, 3, H, W).
 
         Returns:
-            Sigmoid probability map of shape ``(B, 1, H/2, W/2)``.
+            Dense probability masks shaped (B, 1, H, W).
+
+        Raises:
+            None.
         """
-        enc = self.enc1(x)
+
+        enc = self.encoder(x)
         pooled = self.pool(enc)
-        bottleneck = self.bottleneck(pooled)
-        # Upsample back to input size
-        up = F.interpolate(bottleneck, size=x.shape[2:], mode="bilinear", align_corners=False)
-        out = self.dec1(up)
-        return out
+        bridge = self.bridge(pooled)
+        upsampled = F.interpolate(bridge, scale_factor=2.0, mode="bilinear", align_corners=False)
+        return self.decoder(upsampled)
 
     @torch.no_grad()
     def get_7x7_mask(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute binary lung mask at 7×7 spatial resolution.
+        """Return no-grad binary masks at 7x7 resolution.
 
         Args:
-            x: Input images of shape ``(B, 3, H, W)``.
+            x: Input image batch shaped (B, 3, 224, 224).
 
         Returns:
-            Binary mask tensor of shape ``(B, 1, 7, 7)`` with values in ``{0, 1}``.
+            Binary lung mask tensor shaped (B, 1, 7, 7).
+
+        Raises:
+            None.
         """
-        prob_map = self.forward(x)
-        # Downsample to 7×7
-        mask_7 = F.interpolate(prob_map, size=(7, 7), mode="bilinear", align_corners=False)
-        return (mask_7 >= self.threshold).float()
 
+        dense = self.forward(x)
+        reduced = F.interpolate(dense, size=(7, 7), mode="bilinear", align_corners=False)
+        return (reduced >= 0.5).float()
 
-# ─── ProtoCXR Main Model ──────────────────────────────────────────────────────
 
 class ProtoCXR(nn.Module):
-    """Prototype-Based Interpretable Multi-Label CXR Classifier.
-
-    Architecture:
-        Input (B, 3, 224, 224)
-            → DenseNet-121 backbone (spatial feature maps, truncated)
-            → 1×1 Conv projection (1024 → FEAT_DIM)
-            → PrototypeSimilarity layer (FEAT_DIM → C*K similarity maps)
-            → Global max-pool over (H, W) per prototype → (B, C*K)
-            → Non-negative FC (C*K → C) → logits
-            → Sigmoid → predictions
+    """Prototype-based interpretable multi-label classifier for CXR.
 
     Args:
-        num_classes: Number of diagnostic classes C (default 14).
-        num_proto: Number of prototypes per class K.
-        feat_dim: Prototype and projection dimension D.
-        backbone_name: ``timm`` model identifier for the backbone.
-        backbone_pretrained: Load ImageNet-pretrained backbone weights.
-        sim_epsilon: Epsilon for :class:`PrototypeSimilarity`.
-        pretrained_mask_path: Optional path to ``LungMaskNet`` weights.
+        config: Global project config.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If the backbone does not produce expected channels.
     """
 
-    def __init__(
-        self,
-        num_classes: int,
-        num_proto: int,
-        feat_dim: int,
-        backbone_name: str = "densenet121",
-        backbone_pretrained: bool = True,
-        sim_epsilon: float = 1e-4,
-        pretrained_mask_path: Optional[str] = None,
-    ) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.num_classes = num_classes
-        self.num_proto = num_proto
-        self.feat_dim = feat_dim
-        total_proto = num_classes * num_proto
+        self.config = config
+        self.num_classes = config.NUM_CLASSES
+        self.num_proto = config.NUM_PROTO
+        self.total_proto = self.num_classes * self.num_proto
 
-        # ── Backbone ──────────────────────────────────────────────────────────
         self.backbone = timm.create_model(
-            backbone_name,
-            pretrained=backbone_pretrained,
+            config.BACKBONE,
             features_only=True,
+            pretrained=config.BACKBONE_PRETRAINED,
         )
-        # Infer backbone output channels from a dummy forward pass
+
+        # Spec requires 1024 -> FEAT_DIM projection for DenseNet-121 features.
+        self.proj = nn.Conv2d(1024, config.FEAT_DIM, kernel_size=1)
+
+        self.prototypes = nn.Parameter(
+            torch.empty(self.total_proto, config.FEAT_DIM)
+        )
+        nn.init.xavier_uniform_(self.prototypes)
+
+        self.fc = nn.Linear(self.total_proto, self.num_classes, bias=False)
+        nn.init.kaiming_uniform_(self.fc.weight, a=5 ** 0.5)
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224)
-            feats = self.backbone(dummy)
-            backbone_out_ch = feats[-1].shape[1]
+            self.fc.weight.copy_(self.fc.weight.abs())
 
-        # ── Projection 1×1 Conv ───────────────────────────────────────────────
-        self.proj = nn.Conv2d(backbone_out_ch, feat_dim, kernel_size=1, bias=False)
+        self.register_buffer(
+            "proto_class_map",
+            torch.arange(self.num_classes, dtype=torch.long).repeat_interleave(self.num_proto),
+        )
 
-        # ── Prototype layer ───────────────────────────────────────────────────
-        self.prototypes = nn.Parameter(torch.empty(total_proto, feat_dim))
-        nn.init.xavier_uniform_(self.prototypes.unsqueeze(0)).squeeze_(0)
+        self.sim_fn = PrototypeSimilarity(config.SIM_EPSILON)
+        self.lung_net = LungMaskNet(config)
 
-        # ── Similarity function ───────────────────────────────────────────────
-        self.sim_fn = PrototypeSimilarity(epsilon=sim_epsilon)
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract projected spatial embeddings.
 
-        # ── Non-negative FC ───────────────────────────────────────────────────
-        self.fc = nn.Linear(total_proto, num_classes, bias=False)
-        with torch.no_grad():
-            nn.init.kaiming_uniform_(self.fc.weight)
-            self.fc.weight.abs_()
+        Args:
+            x: Input image batch shaped (B, 3, H, W).
 
-        # ── Prototype → class mapping ─────────────────────────────────────────
-        proto_class_map = torch.arange(num_classes).repeat_interleave(num_proto)
-        self.register_buffer("proto_class_map", proto_class_map)
+        Returns:
+            Projected feature maps shaped (B, FEAT_DIM, 7, 7).
 
-        # ── Lung mask network (frozen) ────────────────────────────────────────
-        self.lung_net = LungMaskNet(pretrained_path=pretrained_mask_path)
+        Raises:
+            ValueError: If DenseNet output channel count is unexpected.
+        """
 
-    # ── Forward ───────────────────────────────────────────────────────────────
+        feats = self.backbone(x)[-1]
+        if feats.shape[1] != 1024:
+            raise ValueError(
+                f"Expected DenseNet last feature channels=1024, got {feats.shape[1]}."
+            )
+        return self.proj(feats)
 
     def forward(
         self,
         x: torch.Tensor,
         return_sim_maps: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
-        """Run a forward pass through ProtoCXR.
+        """Run forward pass through ProtoCXR.
 
         Args:
-            x: Input images of shape ``(B, 3, H, W)``.
-            return_sim_maps: If ``True``, also return raw similarity maps
-                             and projected feature maps.
+            x: Input image batch shaped (B, 3, 224, 224).
+            return_sim_maps: Whether to return full similarity maps.
 
         Returns:
-            If ``return_sim_maps=False``:
-                ``(logits, proto_activations)`` where:
-                - ``logits``: ``(B, C)``
-                - ``proto_activations``: ``(B, C*K)``
-            If ``return_sim_maps=True``:
-                ``(logits, sim_maps, features)`` where:
-                - ``logits``: ``(B, C)``
-                - ``sim_maps``: ``(B, C*K, H, W)``
-                - ``features``: ``(B, D, H, W)``
+            If return_sim_maps is True: (logits, sim_maps, feats).
+            Else: (logits, proto_acts).
+
+        Raises:
+            None.
         """
-        # Enforce non-negative FC weights at every forward pass
+
         with torch.no_grad():
             self.fc.weight.clamp_(min=0.0)
 
-        # Feature extraction (take last feature level)
-        feat_list = self.backbone(x)
-        features = self.proj(feat_list[-1])          # (B, D, H, W)
-
-        # Prototype similarity maps
-        sim_maps = self.sim_fn(features, self.prototypes)  # (B, C*K, H, W)
-
-        # Global max-pool over spatial dims
-        proto_activations = sim_maps.amax(dim=(2, 3))      # (B, C*K)
-
-        # Class logits via non-negative FC
-        logits = self.fc(proto_activations)                 # (B, C)
+        feats = self._extract_features(x)
+        sim_maps = self.sim_fn(feats, self.prototypes)
+        proto_acts = sim_maps.amax(dim=(2, 3))
+        logits = self.fc(proto_acts)
 
         if return_sim_maps:
-            return logits, sim_maps, features
-        return logits, proto_activations
-
-    # ── Explanation ───────────────────────────────────────────────────────────
-
-    def get_explanation(
-        self,
-        x: torch.Tensor,
-        class_idx: int,
-    ) -> Dict:
-        """Return an interpretable explanation for a single image–class pair.
-
-        Args:
-            x: Single image tensor of shape ``(1, 3, H, W)``.
-            class_idx: Index of the class to explain.
-
-        Returns:
-            Dictionary with keys:
-                - ``proto_idx`` (int): Most-activated prototype index.
-                - ``spatial_map`` (Tensor[7,7]): Similarity activation map.
-                - ``sim_score`` (float): Maximum similarity score.
-                - ``proto_vector`` (Tensor[D]): Prototype embedding vector.
-
-        Raises:
-            ValueError: If ``x`` does not have batch size 1.
-        """
-        if x.shape[0] != 1:
-            raise ValueError("get_explanation expects a single image (batch size 1).")
-
-        self.eval()
-        with torch.no_grad():
-            _, sim_maps, _ = self.forward(x, return_sim_maps=True)
-            # sim_maps: (1, C*K, H, W)
-
-            # Select prototypes belonging to the requested class
-            class_mask = self.proto_class_map == class_idx       # (C*K,)
-            class_proto_indices = class_mask.nonzero(as_tuple=True)[0]
-
-            # Per-prototype max activations for this image
-            maps_for_class = sim_maps[0, class_proto_indices]    # (K, H, W)
-            max_acts = maps_for_class.amax(dim=(1, 2))           # (K,)
-
-            best_local = max_acts.argmax().item()
-            best_proto_idx = class_proto_indices[best_local].item()
-
-            spatial_map = sim_maps[0, best_proto_idx]            # (H, W)
-            sim_score   = spatial_map.max().item()
-            proto_vec   = self.prototypes[best_proto_idx]        # (D,)
-
-        return {
-            "proto_idx":   int(best_proto_idx),
-            "spatial_map": spatial_map,
-            "sim_score":   float(sim_score),
-            "proto_vector": proto_vec,
-        }
-
-    # ── Prototype Push ────────────────────────────────────────────────────────
+            return logits, sim_maps, feats
+        return logits, proto_acts
 
     @torch.no_grad()
-    def push_prototypes(
-        self,
-        dataloader: DataLoader,
-        device: torch.device,
-    ) -> None:
-        """Replace prototype vectors with nearest training patch embeddings.
-
-        Phase 3 — Prototype Push Algorithm:
-            1. Iterate the full training DataLoader with no gradients.
-            2. Extract projected feature maps for each batch.
-            3. For each prototype p_k, find the patch z* across all spatial
-               locations and images that minimises ||z* - p_k||².
-            4. Replace ``self.prototypes[k] ← z*``.
-
-        Logs the mean displacement (L2 change) after the push.
+    def get_explanation(self, x: torch.Tensor, class_idx: int) -> Dict[str, object]:
+        """Get the most activated prototype explanation for one class.
 
         Args:
-            dataloader: Training DataLoader (images, labels).
-            device: Compute device.
-        """
-        self.eval()
-        total_proto = self.num_classes * self.num_proto
+            x: Single image tensor shaped (1, 3, 224, 224).
+            class_idx: Target class index.
 
-        best_dist  = torch.full((total_proto,), float("inf"), device=device)
-        best_patch = torch.zeros_like(self.prototypes)
+        Returns:
+            Explanation dict with prototype index, map, score, and vector.
+
+        Raises:
+            ValueError: If batch size is not 1 or class_idx is out of range.
+        """
+
+        if x.shape[0] != 1:
+            raise ValueError("get_explanation expects a batch size of 1.")
+        if class_idx < 0 or class_idx >= self.num_classes:
+            raise ValueError(f"class_idx out of range: {class_idx}")
+
+        self.eval()
+        logits, sim_maps, _ = self.forward(x, return_sim_maps=True)
+        del logits
+
+        class_proto_indices = torch.where(self.proto_class_map == class_idx)[0]
+        class_maps = sim_maps[0, class_proto_indices]
+        class_scores = class_maps.amax(dim=(1, 2))
+        local_best = int(class_scores.argmax().item())
+        proto_idx = int(class_proto_indices[local_best].item())
+        spatial_map = sim_maps[0, proto_idx]
+        sim_score = float(spatial_map.max().item())
+        proto_vector = self.prototypes[proto_idx].detach().clone()
+
+        return {
+            "proto_idx": proto_idx,
+            "spatial_map": spatial_map,
+            "sim_score": sim_score,
+            "proto_vector": proto_vector,
+        }
+
+    @torch.no_grad()
+    def push_prototypes(self, dataloader: DataLoader, device: torch.device) -> None:
+        """Push each prototype to its nearest training patch embedding.
+
+        Args:
+            dataloader: Training loader used for search.
+            device: Active compute device.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+        """
+
+        self.eval()
+        old_proto = self.prototypes.data.clone()
+        best_dist = torch.full((self.total_proto,), float("inf"), device=device)
+        best_embed = self.prototypes.data.clone().to(device)
 
         for images, _ in dataloader:
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
+            feats = self._extract_features(images)
+            bsz, dim, height, width = feats.shape
+            patches = feats.permute(0, 2, 3, 1).reshape(bsz * height * width, dim)
+            dists = torch.cdist(patches, self.prototypes.to(device), p=2).pow(2)
+            curr_min, curr_idx = dists.min(dim=0)
 
-            feat_list = self.backbone(images)
-            features  = self.proj(feat_list[-1])      # (B, D, H, W)
+            improved = curr_min < best_dist
+            if improved.any():
+                best_dist = torch.where(improved, curr_min, best_dist)
+                improved_indices = torch.where(improved)[0]
+                best_embed[improved_indices] = patches[curr_idx[improved_indices]]
 
-            B, D, H, W = features.shape
-            # Flatten spatial: (B * H * W, D)
-            patches = features.permute(0, 2, 3, 1).reshape(-1, D)
-            # (B*H*W, 1, D) - (1, P, D) → (B*H*W, P) squared distances
-            diff     = patches.unsqueeze(1) - self.prototypes.unsqueeze(0)
-            dist_sq  = (diff ** 2).sum(dim=-1)        # (B*H*W, P)
-            min_dists, min_ids = dist_sq.min(dim=0)   # (P,) each
-
-            improve_mask = min_dists < best_dist
-            for k in improve_mask.nonzero(as_tuple=True)[0]:
-                k = k.item()
-                best_dist[k]  = min_dists[k]
-                best_patch[k] = patches[min_ids[k]]
-
-        old_protos = self.prototypes.data.clone()
-        self.prototypes.data.copy_(best_patch)
-
-        mean_displacement = (self.prototypes.data - old_protos).norm(dim=1).mean().item()
-        print(f"Prototype push complete. Mean displacement: {mean_displacement:.4f}")
+        self.prototypes.data.copy_(best_embed.to(self.prototypes.device))
+        disp = (self.prototypes.data - old_proto).norm(dim=1).mean().item()
+        print(f"Prototype push done. Mean displacement: {disp:.4f}")
         self.train()
 
-    # ── Freeze helpers ────────────────────────────────────────────────────────
-
     def freeze_backbone(self, freeze: bool = True) -> None:
-        """Freeze or unfreeze backbone parameters.
+        """Freeze or unfreeze backbone and projection parameters.
 
         Args:
-            freeze: If ``True``, disables gradients for the backbone
-                    (including projection layer). If ``False``, enables them.
+            freeze: Whether to freeze parameters.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
         """
+
         for param in self.backbone.parameters():
             param.requires_grad = not freeze
         for param in self.proj.parameters():
             param.requires_grad = not freeze
 
     def freeze_prototypes(self, freeze: bool = True) -> None:
-        """Freeze or unfreeze prototype parameters.
+        """Freeze or unfreeze prototype vectors.
 
         Args:
-            freeze: If ``True``, disables gradient updates for
-                    ``self.prototypes``. If ``False``, enables them.
+            freeze: Whether to freeze prototype parameters.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
         """
+
         self.prototypes.requires_grad = not freeze

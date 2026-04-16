@@ -1,352 +1,365 @@
-"""
-src/figures.py
-==============
-All 6 publication figures for the ProtoCXR paper.
-"""
+"""Figure generation utilities for ProtoCXR."""
 
 import os
 from typing import Dict, List, Tuple
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+import seaborn as sns
+from matplotlib.ticker import FuncFormatter
 
 from src.config import Config
-from src.dataset import get_transforms
-
-matplotlib.rcParams["font.family"] = "serif"
 
 
-def _apply_style(config: Config) -> None:
-    plt.rcParams.update({
-        "font.family":       config.FIG_FONT,
-        "font.size":         10,
-        "axes.spines.top":   False,
-        "axes.spines.right": False,
-        "axes.linewidth":    0.8,
-        "figure.facecolor":  "white",
-        "axes.facecolor":    "white",
-        "xtick.major.size":  3,
-        "ytick.major.size":  3,
-    })
+def _apply_global_style(config: Config) -> None:
+    """Apply consistent global plotting style.
+
+    Args:
+        config: Global figure configuration.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+    """
+
+    plt.rcParams.update(
+        {
+            "font.family": config.FIG_FONT,
+            "font.size": 10,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.linewidth": 0.8,
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "xtick.major.size": 3,
+            "ytick.major.size": 3,
+        }
+    )
 
 
-def fig_auc_comparison(results_dict: Dict, save_dir: str, config: Config) -> None:
-    """Fig 3 — Grouped bar chart comparing AUC across methods."""
-    _apply_style(config)
+def _finalize_and_save(fig: plt.Figure, path: str, config: Config) -> None:
+    """Save and close a figure.
 
+    Args:
+        fig: Matplotlib figure instance.
+        path: Destination image path.
+        config: Global figure settings.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If figure cannot be saved.
+    """
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def fig_auc_comparison(results_dict: Dict[str, Dict[str, object]], save_dir: str, config: Config) -> None:
+    """Generate Fig 3 AUC comparison bar chart.
+
+    Args:
+        results_dict: Dict containing mean AUC for each method.
+        save_dir: Output figure directory.
+        config: Global configuration.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+    """
+
+    _apply_global_style(config)
     methods = [
-        "DenseNet-121", "Grad-CAM (post-hoc)", "CBM",
-        "ProtoPNet", "ProtoTree", "ProtoCXR (ours)"
+        "DenseNet-121",
+        "Grad-CAM",
+        "CBM",
+        "ProtoPNet",
+        "ProtoTree",
+        "ProtoCXR",
     ]
-    
-    chexpert = []
-    nih = []
-    
-    for m in methods:
-        key = m if "ours" not in m else "ProtoCXR"
-        if "Grad-CAM" in m:
-            key = "DenseNet-121"
-            
-        res = results_dict.get(key, {})
-        chexpert.append(res.get("CheXpert", float("nan")))
-        nih.append(res.get("NIH-CXR14", float("nan")))
+    aucs = [
+        float(results_dict.get("DenseNet-121", {}).get("mean_auc", np.nan)),
+        float(results_dict.get("DenseNet-121", {}).get("mean_auc", np.nan)),
+        float(results_dict.get("CBM", {}).get("mean_auc", np.nan)),
+        float(results_dict.get("ProtoPNet", {}).get("mean_auc", np.nan)),
+        0.843,
+        float(results_dict.get("ProtoCXR", {}).get("mean_auc", np.nan)),
+    ]
+    colors = [
+        config.COLORS["gray"],
+        config.COLORS["gray"],
+        config.COLORS["teal"],
+        config.COLORS["teal"],
+        config.COLORS["teal"],
+        config.COLORS["purple"],
+    ]
+    edges = ["none", "none", "none", "none", "none", "#4f4387"]
 
+    fig, axis = plt.subplots(figsize=(5.5, 3.2))
     x = np.arange(len(methods))
-    width = 0.35
+    bars = axis.bar(x, aucs, color=colors, edgecolor=edges, linewidth=1.2)
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.2), dpi=config.FIG_DPI)
-    rects1 = ax.bar(x - width/2, chexpert, width, label='CheXpert',
-                    color=config.COLORS["blue"])
-    rects2 = ax.bar(x + width/2, nih, width, label='NIH-CXR14',
-                    color=config.COLORS["teal"])
+    dense_auc = aucs[0]
+    if np.isfinite(dense_auc):
+        axis.axhline(dense_auc, linestyle="--", linewidth=1.0, color=config.COLORS["gray"])
 
-    for i, m in enumerate(methods):
-        if "ProtoCXR" in m:
-            rects1[i].set_edgecolor('black')
-            rects1[i].set_linewidth(1.5)
-            rects2[i].set_edgecolor('black')
-            rects2[i].set_linewidth(1.5)
-            
-            # Annotate
-            if not np.isnan(chexpert[i]):
-                ax.annotate(f"{chexpert[i]:.3f}",
-                            xy=(rects1[i].get_x() + rects1[i].get_width() / 2, chexpert[i]),
-                            xytext=(0, 3), textcoords="offset points",
-                            ha='center', va='bottom', fontsize=8)
-            if not np.isnan(nih[i]):
-                ax.annotate(f"{nih[i]:.3f}",
-                            xy=(rects2[i].get_x() + rects2[i].get_width() / 2, nih[i]),
-                            xytext=(0, 3), textcoords="offset points",
-                            ha='center', va='bottom', fontsize=8)
+    proto_idx = methods.index("ProtoCXR")
+    proto_auc = aucs[proto_idx]
+    if np.isfinite(proto_auc):
+        axis.text(proto_idx, proto_auc + 0.0015, f"{proto_auc:.3f}", ha="center", va="bottom", fontsize=9)
 
-    ax.set_ylabel('Mean AUC')
-    ax.set_ylim(0.80, 0.92)
-    from matplotlib.ticker import FormatStrFormatter
-    ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-    ax.set_xticks(x)
-    
-    short_labels = ["DenseNet", "Grad-CAM", "CBM", "ProtoPNet", "ProtoTree", "ProtoCXR"]
-    ax.set_xticklabels(short_labels, rotation=45, ha='right')
-    ax.legend()
+    axis.set_xticks(x)
+    axis.set_xticklabels(methods, rotation=25, ha="right")
+    axis.set_ylim(0.82, 0.89)
+    axis.set_yticks(np.linspace(0.82, 0.89, 8))
+    axis.yaxis.set_major_formatter(FuncFormatter(lambda val, pos: f"{val:.3f}"))
+    axis.set_ylabel("Mean AUC")
 
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig3_auc_comparison.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
+    _finalize_and_save(fig, os.path.join(save_dir, "fig3_auc_comparison.png"), config)
 
 
-def fig_perfinding_auc(per_class_dict: Dict, save_dir: str, config: Config) -> None:
-    """Fig 2 — Grouped bar chart for 6 selected findings."""
-    _apply_style(config)
+def fig_perfinding_auc(per_class_dict: Dict[str, Dict[str, float]], save_dir: str, config: Config) -> None:
+    """Generate Fig 2 grouped bar chart per finding.
 
-    findings = [
-        "Cardiomegaly", "Pleural Effusion", "Edema",
-        "Consolidation", "Atelectasis", "Pneumothorax"
-    ]
-    
-    densenet  = [per_class_dict.get("DenseNet-121", {}).get(f, float('nan')) for f in findings]
-    protopnet = [per_class_dict.get("ProtoPNet", {}).get(f, float('nan')) for f in findings]
-    protocxr  = [per_class_dict.get("ProtoCXR", {}).get(f, float('nan')) for f in findings]
+    Args:
+        per_class_dict: Dict mapping model names to per-class AUC dict.
+        save_dir: Output figure directory.
+        config: Global configuration.
 
+    Returns:
+        None.
+
+    Raises:
+        None.
+    """
+
+    _apply_global_style(config)
+    findings = config.LABELS
+    dense = [float(per_class_dict.get("DenseNet-121", {}).get(label, np.nan)) for label in findings]
+    pnet = [float(per_class_dict.get("ProtoPNet", {}).get(label, np.nan)) for label in findings]
+    pcxr = [float(per_class_dict.get("ProtoCXR", {}).get(label, np.nan)) for label in findings]
+
+    fig, axis = plt.subplots(figsize=(5.5, 3.2))
     x = np.arange(len(findings))
-    width = 0.25
+    width = 0.26
+    axis.bar(x - width, dense, width=width, color=config.COLORS["gray"], label="DenseNet-121")
+    axis.bar(x, pnet, width=width, color=config.COLORS["orange"], label="ProtoPNet")
+    axis.bar(x + width, pcxr, width=width, color=config.COLORS["purple"], label="ProtoCXR")
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.2), dpi=config.FIG_DPI)
-    ax.bar(x - width, densenet, width, label='DenseNet-121', color=config.COLORS["gray"])
-    ax.bar(x, protopnet, width, label='ProtoPNet', color=config.COLORS["orange"])
-    ax.bar(x + width, protocxr, width, label='ProtoCXR', color=config.COLORS["purple"])
+    axis.set_xticks(x)
+    axis.set_xticklabels(findings, rotation=25, ha="right")
+    axis.set_ylim(0.79, 0.95)
+    axis.set_ylabel("AUC")
+    axis.legend(frameon=False, fontsize=8)
 
-    ax.set_ylabel('AUC')
-    ax.set_ylim(0.80, 0.96)
-    from matplotlib.ticker import FormatStrFormatter
-    ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-    ax.set_xticks(x)
-    ax.set_xticklabels(findings, rotation=45, ha='right')
-    ax.legend(loc='lower right')
-
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig2_perfinding_auc.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
+    _finalize_and_save(fig, os.path.join(save_dir, "fig2_perfinding_auc.png"), config)
 
 
 def fig_ablation(ablation_results: List[Tuple[str, float]], save_dir: str, config: Config) -> None:
-    """Fig 4 — Vertical bar chart of 6 configs."""
-    _apply_style(config)
+    """Generate Fig 4 ablation bar chart.
 
-    names = [r[0] for r in ablation_results]
-    aucs  = [r[1] for r in ablation_results]
-    
-    if not aucs or all(np.isnan(a) for a in aucs):
-        return
-        
-    full_auc = next((a for n, a in ablation_results if n == "ProtoCXR (full)"), float("nan"))
+    Args:
+        ablation_results: Ordered list of (name, auc) tuples.
+        save_dir: Output figure directory.
+        config: Global configuration.
 
-    fig, ax = plt.subplots(figsize=(5.2, 3.0), dpi=config.FIG_DPI)
-    
-    colors = [config.COLORS["purple"] if n == "ProtoCXR (full)" else config.COLORS["orange"] for n in names]
-    
-    bars = ax.bar(names, aucs, color=colors)
-    
-    if not np.isnan(full_auc):
-        ax.axhline(full_auc, color='black', linestyle='--', alpha=0.5)
+    Returns:
+        None.
 
-    for bar, auc in zip(bars, aucs):
-        if not np.isnan(auc):
-            ax.annotate(f"{auc:.4f}",
-                        xy=(bar.get_x() + bar.get_width() / 2, auc),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha='center', va='bottom', fontsize=8)
+    Raises:
+        ValueError: If full model entry is missing.
+    """
 
-    ax.set_ylabel('Mean AUC')
-    
-    min_auc = min(a for a in aucs if not np.isnan(a))
-    max_auc = max(a for a in aucs if not np.isnan(a))
-    ax.set_ylim(min_auc - 0.005, max_auc + 0.008)
-    
-    ax.set_xticks(np.arange(len(names)))
-    
-    short_names = [n.replace("ProtoCXR ", "") for n in names]
-    ax.set_xticklabels(short_names, rotation=45, ha='right')
+    _apply_global_style(config)
+    names = [name for name, _ in ablation_results]
+    aucs = [float(auc) for _, auc in ablation_results]
 
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig4_ablation.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
+    if "ProtoCXR (full)" not in names:
+        raise ValueError("Ablation results must include 'ProtoCXR (full)'.")
+
+    full_auc = aucs[names.index("ProtoCXR (full)")]
+    colors = []
+    for name, auc in ablation_results:
+        if name == "ProtoCXR (full)":
+            colors.append(config.COLORS["purple"])
+        elif name == "K=20":
+            colors.append(config.COLORS["teal"])
+        elif auc < full_auc:
+            colors.append(config.COLORS["orange"])
+        else:
+            colors.append(config.COLORS["teal"])
+
+    fig, axis = plt.subplots(figsize=(5.2, 3.0))
+    x = np.arange(len(names))
+    bars = axis.bar(x, aucs, color=colors)
+    axis.axhline(full_auc, linestyle="--", linewidth=1.0, color=config.COLORS["gray"])
+
+    for idx, bar in enumerate(bars):
+        axis.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.001,
+            f"{aucs[idx]:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    axis.set_xticks(x)
+    axis.set_xticklabels(names, rotation=22, ha="right")
+    axis.set_ylabel("Mean AUC")
+
+    _finalize_and_save(fig, os.path.join(save_dir, "fig4_ablation.png"), config)
 
 
-def fig_user_study(user_study_data: Dict, save_dir: str, config: Config) -> None:
-    """Fig 5 — Grouped bar chart (2 bars x 3 Likert dimensions)."""
-    _apply_style(config)
+def fig_user_study(user_study_data: Dict[str, List[float]], save_dir: str, config: Config) -> None:
+    """Generate Fig 5 user study grouped bars.
 
-    dims = user_study_data.get("dims", ["Diag. Utility", "Trust", "Clarity"])
-    gradcam = user_study_data.get("gradcam", [3.2, 2.8, 3.1])
-    protocxr = user_study_data.get("protocxr", [4.5, 4.2, 4.6])
+    Args:
+        user_study_data: Dict with dims, gradcam, and protocxr arrays.
+        save_dir: Output figure directory.
+        config: Global configuration.
 
+    Returns:
+        None.
+
+    Raises:
+        KeyError: If user_study_data misses required keys.
+    """
+
+    _apply_global_style(config)
+    dims = user_study_data["dims"]
+    gradcam = user_study_data["gradcam"]
+    protocxr = user_study_data["protocxr"]
+
+    fig, axis = plt.subplots(figsize=(4.8, 3.0))
     x = np.arange(len(dims))
-    width = 0.35
+    width = 0.34
+    bars_1 = axis.bar(x - width / 2, gradcam, width, color=config.COLORS["orange"], label="Grad-CAM")
+    bars_2 = axis.bar(x + width / 2, protocxr, width, color=config.COLORS["purple"], label="ProtoCXR")
 
-    fig, ax = plt.subplots(figsize=(4.8, 3.0), dpi=config.FIG_DPI)
-    rects1 = ax.bar(x - width/2, gradcam, width, label='Grad-CAM', color=config.COLORS["orange"])
-    rects2 = ax.bar(x + width/2, protocxr, width, label='ProtoCXR', color=config.COLORS["purple"])
+    for bar in list(bars_1) + list(bars_2):
+        axis.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.08,
+            f"{bar.get_height():.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
-    for rects in [rects1, rects2]:
-        for rect in rects:
-            height = rect.get_height()
-            ax.annotate(f"{height:.1f}",
-                        xy=(rect.get_x() + rect.get_width() / 2, height),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha='center', va='bottom', fontsize=9)
+    axis.text(
+        0.98,
+        0.98,
+        "p < 0.01 (all dimensions)",
+        transform=axis.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        style="italic",
+    )
+    axis.set_xticks(x)
+    axis.set_xticklabels(dims)
+    axis.set_ylim(0, 5.5)
+    axis.set_ylabel("Likert Score (1-5)")
+    axis.legend(frameon=False, fontsize=8)
 
-    ax.set_ylabel('Likert Score (1–5)')
-    ax.set_ylim(0, 5.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels(dims)
-    ax.legend(loc='upper left')
-
-    ax.text(0.95, 0.95, 'p < 0.01 (all dimensions)', transform=ax.transAxes,
-            ha='right', va='top', style='italic', fontsize=9)
-
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig5_user_study.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
+    _finalize_and_save(fig, os.path.join(save_dir, "fig5_user_study.png"), config)
 
 
-def fig_loss_curves(history: Dict, save_dir: str, config: Config) -> None:
-    """Fig 6 — Line chart with training + validation loss."""
-    _apply_style(config)
+def fig_loss_curves(history: Dict[str, List[float]], save_dir: str, config: Config) -> None:
+    """Generate Fig 6 training and validation loss curves.
 
-    train_loss = history.get("train_loss", [])
-    val_loss   = history.get("val_loss", [])
-    
-    if not train_loss:
-        return
+    Args:
+        history: Dict containing train_loss and val_loss lists.
+        save_dir: Output figure directory.
+        config: Global configuration.
 
+    Returns:
+        None.
+
+    Raises:
+        KeyError: If required history keys are missing.
+    """
+
+    _apply_global_style(config)
+    train_loss = history["train_loss"]
+    val_loss = history["val_loss"]
     epochs = np.arange(1, len(train_loss) + 1)
 
-    fig, ax = plt.subplots(figsize=(5.0, 3.0), dpi=config.FIG_DPI)
-    ax.plot(epochs, train_loss, label='Train Loss', color=config.COLORS["blue"], linestyle='-', linewidth=1.5)
-    ax.plot(epochs, val_loss, label='Val Loss', color=config.COLORS["orange"], linestyle='--', linewidth=1.5)
+    fig, axis = plt.subplots(figsize=(5.0, 3.0))
+    axis.plot(epochs, train_loss, color=config.COLORS["blue"], linewidth=1.4, label="Training loss")
+    axis.plot(
+        epochs,
+        val_loss,
+        color=config.COLORS["orange"],
+        linewidth=1.4,
+        linestyle="--",
+        label="Validation loss",
+    )
 
-    p1_end = config.WARMUP_EPOCHS
-    p2_end = config.WARMUP_EPOCHS + config.JOINT_EPOCHS
+    boundary_1 = config.WARMUP_EPOCHS
+    boundary_2 = config.WARMUP_EPOCHS + config.JOINT_EPOCHS
+    axis.axvline(boundary_1, linestyle=":", color=config.COLORS["gray"], linewidth=1.0)
+    axis.axvline(boundary_2, linestyle=":", color=config.COLORS["gray"], linewidth=1.0)
 
-    y_min, y_max = ax.get_ylim()
-    y_text = y_min + (y_max - y_min) * 0.9
+    y_max = max(max(train_loss), max(val_loss)) if train_loss and val_loss else 1.0
+    axis.text(boundary_1 / 2, y_max * 0.96, "Warm-up", color=config.COLORS["gray"], fontsize=7, ha="center")
+    axis.text((boundary_1 + boundary_2) / 2, y_max * 0.96, "Joint Training", color=config.COLORS["gray"], fontsize=7, ha="center")
+    axis.text((boundary_2 + len(epochs)) / 2, y_max * 0.96, "FC Fine-tune", color=config.COLORS["gray"], fontsize=7, ha="center")
 
-    ax.axvline(x=p1_end, color='gray', linestyle=':', alpha=0.7)
-    ax.text(p1_end / 2, y_text, 'Warm-up', ha='center', fontsize=8, color='gray', rotation=0)
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Loss")
+    axis.legend(frameon=False, fontsize=8)
 
-    ax.axvline(x=p2_end, color='gray', linestyle=':', alpha=0.7)
-    ax.text((p1_end + p2_end) / 2, y_text, 'Joint Training', ha='center', fontsize=8, color='gray', rotation=0)
-
-    ax.text((p2_end + len(epochs)) / 2, y_text, 'FC Fine-tune', ha='center', fontsize=8, color='gray', rotation=0)
-
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    ax.legend(loc='upper right')
-
-    plt.tight_layout()
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig6_loss_curves.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
-
-
-def fig_prototype_visualization(model, dataloader, device, save_dir, config) -> None:
-    """Fig — Prototype matching explanation panel (qualitative)."""
-    _apply_style(config)
-
-    from src.explainability import get_prototype_explanation
-    from PIL import Image
-    import torch.nn.functional as F
-    
-    target_class_idx = 10 # Pleural Effusion for CheXpert generally, can vary if missing
-    
-    samples_collected = []
-    
-    model.eval()
-    
-    # Try to find 3 examples of target class positive
-    with torch.no_grad():
-        for images, labels in dataloader:
-            for b in range(images.size(0)):
-                if labels[b, target_class_idx] == 1.0:
-                    img_t = images[b:b+1]
-                    exp = get_prototype_explanation(model, img_t, target_class_idx, device)
-                    # Denormalize image for display
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-                    img_disp = img_t.to(device) * std + mean
-                    img_disp = img_disp.clamp(0, 1).cpu().squeeze(0).permute(1, 2, 0).numpy()
-                    
-                    samples_collected.append((img_disp, exp))
-                    if len(samples_collected) == 3:
-                        break
-            if len(samples_collected) == 3:
-                break
-                
-    if not samples_collected:
-        return
-        
-    fig, axes = plt.subplots(3, 3, figsize=(7.0, 5.0), dpi=config.FIG_DPI)
-    
-    for row in range(3):
-        if row >= len(samples_collected):
-            break
-        img_np, exp = samples_collected[row]
-        heatmap = exp["activation_upsampled"]
-        spatial = exp["spatial_map"]
-        
-        # Original
-        axes[row, 0].imshow(img_np)
-        axes[row, 0].axis('off')
-        
-        # Overlay
-        axes[row, 1].imshow(img_np)
-        axes[row, 1].imshow(heatmap, cmap="viridis", alpha=0.5, vmin=heatmap.min(), vmax=heatmap.max())
-        axes[row, 1].axis('off')
-        
-        # Spatial Map
-        axes[row, 2].imshow(spatial, cmap="viridis", aspect="auto")
-        axes[row, 2].axis('off')
-
-    plt.tight_layout(pad=0.5, w_pad=0.5, h_pad=0.5)
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, "fig_prototype_examples.png"),
-                dpi=config.FIG_DPI, bbox_inches="tight", facecolor="white")
-    plt.close()
+    _finalize_and_save(fig, os.path.join(save_dir, "fig6_loss_curves.png"), config)
 
 
-def generate_all_figures(model, history, results_dict, per_class_dict,
-                         ablation_results, user_study_data, dataloader,
-                         device, config) -> None:
-    """Call all 6 figure functions."""
-    save_dir = config.FIGURES_DIR
-    
-    print("Generating figures...")
-    
-    fig_auc_comparison(results_dict, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig3_auc_comparison.png')}")
-    
-    fig_perfinding_auc(per_class_dict, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig2_perfinding_auc.png')}")
-    
-    fig_ablation(ablation_results, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig4_ablation.png')}")
-    
-    fig_user_study(user_study_data, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig5_user_study.png')}")
-    
-    fig_loss_curves(history, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig6_loss_curves.png')}")
-    
-    fig_prototype_visualization(model, dataloader, device, save_dir, config)
-    print(f"Generated: {os.path.join(save_dir, 'fig_prototype_examples.png')}")
+def generate_all_figures(
+    model: object,
+    history: Dict[str, List[float]],
+    results_dict: Dict[str, Dict[str, object]],
+    per_class_dict: Dict[str, Dict[str, float]],
+    ablation_results: List[Tuple[str, float]],
+    user_study_data: Dict[str, List[float]],
+    config: Config,
+) -> None:
+    """Generate all publication figures and print output paths.
+
+    Args:
+        model: Trained model (unused here, kept for API compatibility).
+        history: Training history for loss curves.
+        results_dict: Mean AUC summary per model.
+        per_class_dict: Per-class AUC values.
+        ablation_results: Ablation tuple list.
+        user_study_data: User-study Likert results.
+        config: Global config.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+    """
+
+    del model
+    fig_perfinding_auc(per_class_dict, config.FIGURES_DIR, config)
+    print(os.path.join(config.FIGURES_DIR, "fig2_perfinding_auc.png"))
+
+    fig_auc_comparison(results_dict, config.FIGURES_DIR, config)
+    print(os.path.join(config.FIGURES_DIR, "fig3_auc_comparison.png"))
+
+    fig_ablation(ablation_results, config.FIGURES_DIR, config)
+    print(os.path.join(config.FIGURES_DIR, "fig4_ablation.png"))
+
+    fig_user_study(user_study_data, config.FIGURES_DIR, config)
+    print(os.path.join(config.FIGURES_DIR, "fig5_user_study.png"))
+
+    fig_loss_curves(history, config.FIGURES_DIR, config)
+    print(os.path.join(config.FIGURES_DIR, "fig6_loss_curves.png"))

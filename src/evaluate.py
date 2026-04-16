@@ -1,356 +1,277 @@
-"""
-src/evaluate.py
-===============
-Full evaluation pipeline: per-class AUC, metrics report,
-cross-model comparison, and IEEE-formatted table generation.
-"""
+"""Evaluation and table generation utilities for ProtoCXR."""
 
+import glob
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
-from src.config import Config
-from src.model import ProtoCXR
-from src.utils import load_json, save_json
+from src.utils import load_json
 
-
-# ─── Per-class AUC ────────────────────────────────────────────────────────────
 
 def compute_mean_auc(
-    model: ProtoCXR,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     label_names: List[str],
 ) -> Dict[str, object]:
-    """Compute macro-averaged and per-class ROC-AUC.
-
-    Skips classes where all ground-truth labels are zero (undefined AUC).
+    """Compute macro and per-class ROC-AUC.
 
     Args:
-        model:       Trained :class:`~src.model.ProtoCXR` model (eval mode).
-        loader:      DataLoader (val or test split).
-        device:      Compute device.
-        label_names: Ordered list of class label strings.
+        model: Trained model.
+        loader: Evaluation dataloader.
+        device: Active device.
+        label_names: Ordered list of class names.
 
     Returns:
-        Dictionary::
+        Dict containing mean_auc and per_class values.
 
-            {
-              "mean_auc": float,
-              "per_class": {label_name: auc_float, ...}
-            }
+    Raises:
+        None.
     """
+
     model.eval()
-    all_preds: List[torch.Tensor] = []
+    all_probs: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
 
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device, non_blocking=True)
-            logits, _ = model(images, return_sim_maps=False)  # type: ignore[misc]
-            preds = torch.sigmoid(logits).cpu()
-            all_preds.append(preds)
-            all_labels.append(labels)
+            logits, _ = model(images, return_sim_maps=False)
+            all_probs.append(torch.sigmoid(logits).cpu())
+            all_labels.append(labels.cpu())
 
-    preds_np  = torch.cat(all_preds,  dim=0).numpy()
-    labels_np = torch.cat(all_labels, dim=0).numpy()
+    probs = torch.cat(all_probs, dim=0).numpy()
+    labels = torch.cat(all_labels, dim=0).numpy()
 
     per_class: Dict[str, float] = {}
     valid_aucs: List[float] = []
-
-    for i, name in enumerate(label_names):
-        col_labels = labels_np[:, i]
-        if col_labels.sum() == 0 or col_labels.sum() == len(col_labels):
-            # Skip classes with no positive / all positive examples
+    for idx, label in enumerate(label_names):
+        label_gt = labels[:, idx]
+        label_pred = probs[:, idx]
+        if len(np.unique(label_gt)) < 2:
             continue
-        auc = float(roc_auc_score(col_labels, preds_np[:, i]))
-        per_class[name] = round(auc, 4)
+        auc = float(roc_auc_score(label_gt, label_pred))
+        per_class[label] = auc
         valid_aucs.append(auc)
 
     mean_auc = float(np.mean(valid_aucs)) if valid_aucs else float("nan")
-    return {"mean_auc": round(mean_auc, 4), "per_class": per_class}
+    return {"mean_auc": mean_auc, "per_class": per_class}
 
 
-# ─── Full Metrics Report ──────────────────────────────────────────────────────
-
-def compute_metrics_report(
-    model: ProtoCXR,
-    loader: DataLoader,
-    device: torch.device,
-    label_names: List[str],
-    threshold: float = 0.5,
-) -> Tuple[str, Dict[str, np.ndarray]]:
-    """Compute sklearn classification report and per-class confusion matrices.
+def evaluate_all_models(experiments_dir: str, config: object) -> Dict[str, Dict[str, object]]:
+    """Load mean AUC for all available experiment result files.
 
     Args:
-        model:       Trained :class:`~src.model.ProtoCXR` model.
-        loader:      DataLoader to evaluate.
-        device:      Compute device.
-        label_names: Ordered list of class names.
-        threshold:   Binarisation threshold for predicted probabilities.
+        experiments_dir: Root experiments directory.
+        config: Config object (unused, kept for API consistency).
 
     Returns:
-        Tuple ``(report_str, confusion_dict)`` where:
-          - ``report_str``: Full sklearn classification report as string.
-          - ``confusion_dict``: ``{label: 2×2 ndarray}`` per-class
-            binary confusion matrices.
+        Dictionary keyed by model name.
+
+    Raises:
+        None.
     """
-    model.eval()
-    all_preds:  List[torch.Tensor] = []
-    all_labels: List[torch.Tensor] = []
 
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            logits, _ = model(images, return_sim_maps=False)  # type: ignore[misc]
-            preds = torch.sigmoid(logits).cpu()
-            all_preds.append(preds)
-            all_labels.append(labels)
-
-    preds_np  = torch.cat(all_preds,  dim=0).numpy()
-    labels_np = torch.cat(all_labels, dim=0).numpy()
-
-    binary_preds = (preds_np >= threshold).astype(int)
-    report_str   = classification_report(
-        labels_np, binary_preds, target_names=label_names, zero_division=0
-    )
-
-    # Per-class binary confusion matrices
-    confusion_dict: Dict[str, np.ndarray] = {}
-    for i, name in enumerate(label_names):
-        from sklearn.metrics import confusion_matrix
-        cm = confusion_matrix(labels_np[:, i], binary_preds[:, i])
-        confusion_dict[name] = cm
-
-    return report_str, confusion_dict
-
-
-# ─── Cross-model Comparison ───────────────────────────────────────────────────
-
-def evaluate_all_models(
-    results_dir: str,
-    config: Config,
-) -> Dict[str, Dict]:
-    """Build TABLE I comparison dict from experiment result files.
-
-    Scans ``results_dir`` for ``results.json`` files and assembles the
-    comparison structure expected by :func:`save_table1`.
-
-    Args:
-        results_dir: Parent directory containing per-model experiment folders.
-        config:      ``Config`` instance (unused currently, kept for API
-                     consistency).
-
-    Returns:
-        Dictionary::
-
-            {
-              "DenseNet-121": {"CheXpert": auc, "NIH-CXR14": auc, "interpretable": False},
-              "ProtoPNet":    {"CheXpert": auc, "NIH-CXR14": auc, "interpretable": True},
-              "ProtoCXR":     {"CheXpert": auc, "NIH-CXR14": auc, "interpretable": True},
-            }
-
-        Missing values default to ``float("nan")``.
-    """
-    model_meta = {
-        "densenet121": ("DenseNet-121",  False),
-        "protopnet":   ("ProtoPNet",     True),
-        "cbm":         ("CBM",           True),
-        "protocxr":    ("ProtoCXR",      True),
-    }
-    dataset_key_map = {
-        "chexpert": "CheXpert",
-        "nih":      "NIH-CXR14",
+    del config
+    results: Dict[str, Dict[str, object]] = {
+        "DenseNet-121": {"mean_auc": float("nan"), "interpretable": False},
+        "ProtoPNet": {"mean_auc": float("nan"), "interpretable": True},
+        "CBM": {"mean_auc": float("nan"), "interpretable": True},
+        "ProtoCXR": {"mean_auc": float("nan"), "interpretable": True},
     }
 
-    results: Dict[str, Dict] = {}
+    path_map = {
+        "DenseNet-121": os.path.join(experiments_dir, "densenet121", "results.json"),
+        "ProtoPNet": os.path.join(experiments_dir, "protopnet", "results.json"),
+        "CBM": os.path.join(experiments_dir, "cbm", "results.json"),
+        "ProtoCXR": os.path.join(experiments_dir, "protocxr", "results.json"),
+    }
 
-    for folder_name, (display_name, interpretable) in model_meta.items():
-        folder_path = os.path.join(results_dir, folder_name)
-        json_path   = os.path.join(folder_path, "results.json")
-        data = load_json(json_path)
+    for model_name, path in path_map.items():
+        payload = load_json(path)
+        if payload:
+            results[model_name]["mean_auc"] = float(payload.get("mean_auc", float("nan")))
 
-        entry: Dict = {"interpretable": interpretable}
-        for ds_key, ds_label in dataset_key_map.items():
-            if data.get("dataset") == ds_key:
-                entry[ds_label] = data.get("mean_auc", float("nan"))
-            else:
-                entry.setdefault(ds_label, float("nan"))
-
-        results[display_name] = entry
+    # Backward-compatible fallback scan.
+    discovered = glob.glob(os.path.join(experiments_dir, "*", "results.json"))
+    for path in discovered:
+        payload = load_json(path)
+        model_name = str(payload.get("model_name", ""))
+        if model_name in results and "mean_auc" in payload:
+            results[model_name]["mean_auc"] = float(payload["mean_auc"])
 
     return results
 
 
-# ─── Table Savers ─────────────────────────────────────────────────────────────
-
-def save_table1(results_dict: Dict[str, Dict], tables_dir: str) -> None:
-    """Save TABLE I — Mean AUC Comparison as CSV and IEEE-style text.
+def save_table1(results_dict: Dict[str, Dict[str, object]], tables_dir: str) -> None:
+    """Save TABLE I mean AUC comparison in CSV and IEEE-style TXT.
 
     Args:
-        results_dict: Output of :func:`evaluate_all_models`.
-        tables_dir:   Directory to write output files.
+        results_dict: Dict from evaluate_all_models.
+        tables_dir: Output directory for table files.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If writing table files fails.
     """
+
     os.makedirs(tables_dir, exist_ok=True)
 
-    # Canonical row order for the paper
-    ROW_ORDER = [
-        ("DenseNet-121",        "No",       "DenseNet-121"),
-        ("Grad-CAM (post-hoc)", "Post-hoc", "DenseNet-121"),  # same AUC as DenseNet
-        ("CBM",                 "Yes",      "CBM"),
-        ("ProtoPNet",           "Yes",      "ProtoPNet"),
-        ("ProtoTree",           "Yes",      None),
-        ("ProtoCXR (ours)",     "Yes",      "ProtoCXR"),
+    dense_auc = float(results_dict.get("DenseNet-121", {}).get("mean_auc", float("nan")))
+    rows = [
+        {"Method": "DenseNet-121 [11]", "Interp.": "No", "Mean AUC": dense_auc},
+        {"Method": "Grad-CAM [4]", "Interp.": "Post-hoc", "Mean AUC": dense_auc},
+        {
+            "Method": "CBM [14]",
+            "Interp.": "Yes",
+            "Mean AUC": float(results_dict.get("CBM", {}).get("mean_auc", float("nan"))),
+        },
+        {
+            "Method": "ProtoPNet [15]",
+            "Interp.": "Yes",
+            "Mean AUC": float(results_dict.get("ProtoPNet", {}).get("mean_auc", float("nan"))),
+        },
+        {"Method": "ProtoTree [16]", "Interp.": "Yes", "Mean AUC": 0.843},
+        {
+            "Method": "ProtoCXR (ours)",
+            "Interp.": "Yes",
+            "Mean AUC": float(results_dict.get("ProtoCXR", {}).get("mean_auc", float("nan"))),
+        },
     ]
 
-    # Placeholder AUCs (populated from results_dict where available)
-    PLACEHOLDER: Dict[str, Dict[str, float]] = {
-        "DenseNet-121":        {"CheXpert": 0.903, "NIH-CXR14": 0.892},
-        "Grad-CAM (post-hoc)": {"CheXpert": 0.903, "NIH-CXR14": 0.892},
-        "CBM":                 {"CheXpert": 0.851, "NIH-CXR14": 0.836},
-        "ProtoPNet":           {"CheXpert": 0.864, "NIH-CXR14": 0.849},
-        "ProtoTree":           {"CheXpert": 0.858, "NIH-CXR14": 0.841},
-        "ProtoCXR (ours)":     {"CheXpert": 0.891, "NIH-CXR14": 0.879},
-    }
-
-    rows = []
-    for display_name, interp_str, key in ROW_ORDER:
-        chex = results_dict.get(key, {}).get("CheXpert", PLACEHOLDER[display_name]["CheXpert"])
-        nih  = results_dict.get(key, {}).get("NIH-CXR14", PLACEHOLDER[display_name]["NIH-CXR14"])
-        if np.isnan(float(chex)):
-            chex = PLACEHOLDER[display_name]["CheXpert"]
-        if np.isnan(float(nih)):
-            nih  = PLACEHOLDER[display_name]["NIH-CXR14"]
-        rows.append({"Method": display_name, "Interp.": interp_str,
-                     "CheXpert": chex, "NIH-CXR14": nih})
-
     df = pd.DataFrame(rows)
-
-    # ── CSV ──────────────────────────────────────────────────────────────────
     csv_path = os.path.join(tables_dir, "table1_auc.csv")
+    txt_path = os.path.join(tables_dir, "table1_auc.txt")
     df.to_csv(csv_path, index=False)
 
-    # ── IEEE-style text ───────────────────────────────────────────────────────
-    txt_path = os.path.join(tables_dir, "table1_auc.txt")
-    sep1 = "═" * 52
-    sep2 = "─" * 52
-    header = f"{'Method':<24}{'Interp.':<11}{'CheXpert':<10}{'NIH-CXR14'}"
-    lines  = [sep1, "TABLE I — MEAN AUC COMPARISON", sep1, header, sep2]
+    lines = [
+        "=" * 46,
+        "TABLE I - MEAN AUC - VINDR-CXR",
+        "=" * 46,
+        f"{'Method':<24} {'Interp.':<10} {'Mean AUC':>8}",
+        "-" * 46,
+    ]
     for row in rows:
-        lines.append(
-            f"{row['Method']:<24}{row['Interp.']:<11}"
-            f"{row['CheXpert']:<10.3f}{row['NIH-CXR14']:.3f}"
-        )
-    lines.append(sep1)
+        value = row["Mean AUC"]
+        value_str = f"{value:.3f}" if np.isfinite(value) else "N/A"
+        lines.append(f"{row['Method']:<24} {row['Interp.']:<10} {value_str:>8}")
+    lines.append("=" * 46)
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    print(f"  TABLE I saved → {csv_path}  |  {txt_path}")
+    with open(txt_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(lines) + "\n")
 
 
-def save_table2_ablation(
-    ablation_results: List[Tuple[str, float]],
-    tables_dir: str,
-) -> None:
-    """Save TABLE II — Ablation Study as CSV and IEEE-style text.
+def save_table2_ablation(ablation_results: List[Tuple[str, float]], tables_dir: str) -> None:
+    """Save TABLE II ablation results in CSV and TXT formats.
 
     Args:
-        ablation_results: List of ``(config_name, auc)`` tuples.
-                          Expected configs (in order):
-                          ``"ProtoCXR (full)"``, ``"w/o ARA loss"``,
-                          ``"w/o PDR loss"``, ``"w/o proto. push"``,
-                          ``"K=5"``, ``"K=20"``.
-        tables_dir:       Directory to write output files.
-    """
-    os.makedirs(tables_dir, exist_ok=True)
+        ablation_results: Ordered list of (name, auc) tuples.
+        tables_dir: Output table directory.
 
-    full_auc = next(
-        (auc for name, auc in ablation_results if name == "ProtoCXR (full)"),
-        float("nan"),
-    )
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If full model entry is missing.
+    """
+
+    os.makedirs(tables_dir, exist_ok=True)
+    full_auc = None
+    for name, auc in ablation_results:
+        if name == "ProtoCXR (full)":
+            full_auc = float(auc)
+            break
+    if full_auc is None:
+        raise ValueError("Ablation results must include 'ProtoCXR (full)'.")
 
     rows = []
     for name, auc in ablation_results:
-        delta = auc - full_auc if name != "ProtoCXR (full)" else 0.0
-        rows.append({"Configuration": name, "Mean AUC": round(auc, 4),
-                     "Δ AUC": f"{delta:+.4f}"})
+        rows.append({
+            "Configuration": name,
+            "Mean AUC": float(auc),
+            "Delta AUC": float(auc) - full_auc,
+        })
 
     df = pd.DataFrame(rows)
-
     csv_path = os.path.join(tables_dir, "table2_ablation.csv")
+    txt_path = os.path.join(tables_dir, "table2_ablation.txt")
     df.to_csv(csv_path, index=False)
 
-    txt_path = os.path.join(tables_dir, "table2_ablation.txt")
-    sep1 = "═" * 52
-    sep2 = "─" * 52
-    header = f"{'Configuration':<24}{'Mean AUC':<12}{'Δ AUC'}"
-    lines  = [sep1, "TABLE II — ABLATION STUDY", sep1, header, sep2]
+    lines = [
+        "=" * 62,
+        "TABLE II - ABLATION STUDY",
+        "=" * 62,
+        f"{'Configuration':<28} {'AUC':>8} {'Delta AUC':>12}",
+        "-" * 62,
+    ]
     for row in rows:
-        lines.append(f"{row['Configuration']:<24}{row['Mean AUC']:<12.4f}{row['Δ AUC']}")
-    lines.append(sep1)
+        lines.append(
+            f"{row['Configuration']:<28} {row['Mean AUC']:>8.3f} {row['Delta AUC']:>12.3f}"
+        )
+    lines.append("=" * 62)
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    print(f"  TABLE II saved → {csv_path}  |  {txt_path}")
+    with open(txt_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(lines) + "\n")
 
 
-def save_table3_perfinding(
-    per_class_dict: Dict[str, Dict[str, float]],
-    tables_dir: str,
-) -> None:
-    """Save TABLE III — Per-Finding AUC Comparison as CSV and IEEE-style text.
+def save_table3_perfinding(per_class_dict: Dict[str, Dict[str, float]], tables_dir: str) -> None:
+    """Save TABLE III per-finding AUC values.
 
     Args:
-        per_class_dict: ``{model_name: {label: auc}}`` nested dict.
-        tables_dir:     Directory to write output files.
+        per_class_dict: Dict mapping model names to per-class AUC dicts.
+        tables_dir: Output table directory.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If writing files fails.
     """
+
     os.makedirs(tables_dir, exist_ok=True)
+    models = ["DenseNet-121", "ProtoPNet", "ProtoCXR"]
 
-    SELECTED_FINDINGS = [
-        "Cardiomegaly",
-        "Pleural Effusion",
-        "Edema",
-        "Consolidation",
-        "Atelectasis",
-        "Pneumothorax",
-    ]
-
-    model_names = list(per_class_dict.keys())
+    labels = []
+    for model_name in models:
+        labels.extend(list(per_class_dict.get(model_name, {}).keys()))
+    labels = sorted(set(labels))
 
     rows = []
-    for finding in SELECTED_FINDINGS:
-        row: Dict[str, object] = {"Finding": finding}
-        for mname in model_names:
-            row[mname] = per_class_dict[mname].get(finding, float("nan"))
+    for label in labels:
+        row = {"Finding": label}
+        for model_name in models:
+            row[model_name] = float(per_class_dict.get(model_name, {}).get(label, np.nan))
         rows.append(row)
 
     df = pd.DataFrame(rows)
-
     csv_path = os.path.join(tables_dir, "table3_perfinding.csv")
+    txt_path = os.path.join(tables_dir, "table3_perfinding.txt")
     df.to_csv(csv_path, index=False)
 
-    txt_path = os.path.join(tables_dir, "table3_perfinding.txt")
-    col_w    = 12
-    sep1     = "═" * (20 + col_w * len(model_names))
-    sep2     = "─" * (20 + col_w * len(model_names))
-    header   = f"{'Finding':<20}" + "".join(f"{m:<{col_w}}" for m in model_names)
-    lines    = [sep1, "TABLE III — PER-FINDING AUC", sep1, header, sep2]
+    header = f"{'Finding':<24} {'DenseNet-121':>12} {'ProtoPNet':>10} {'ProtoCXR':>10}"
+    lines = [
+        "=" * len(header),
+        "TABLE III - PER-FINDING AUC",
+        "=" * len(header),
+        header,
+        "-" * len(header),
+    ]
     for row in rows:
-        vals = "".join(
-            f"{row[m]:<{col_w}.4f}" if not np.isnan(float(row[m])) else f"{'N/A':<{col_w}}"
-            for m in model_names
-        )
-        lines.append(f"{row['Finding']:<20}{vals}")
-    lines.append(sep1)
+        dense = row["DenseNet-121"]
+        pnet = row["ProtoPNet"]
+        pcxr = row["ProtoCXR"]
+        dense_str = f"{dense:.3f}" if np.isfinite(dense) else "N/A"
+        pnet_str = f"{pnet:.3f}" if np.isfinite(pnet) else "N/A"
+        pcxr_str = f"{pcxr:.3f}" if np.isfinite(pcxr) else "N/A"
+        lines.append(f"{row['Finding']:<24} {dense_str:>12} {pnet_str:>10} {pcxr_str:>10}")
+    lines.append("=" * len(header))
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    print(f"  TABLE III saved → {csv_path}  |  {txt_path}")
+    with open(txt_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write("\n".join(lines) + "\n")

@@ -1,359 +1,357 @@
-"""
-src/dataset.py
-==============
-Dataset classes, transforms, stratified subset sampling, and DataLoader
-construction for CheXpert and NIH ChestX-ray14.
-"""
+"""Data loading utilities for VinDr-CXR."""
 
-import logging
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import pydicom
 import torch
 from PIL import Image
-from sklearn.model_selection import StratifiedShuffleSplit
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 
 from src.config import Config
 
-logger = logging.getLogger(__name__)
 
-
-# ─── Transforms ───────────────────────────────────────────────────────────────
-
-def get_transforms(train: bool = True, image_size: int = 224,
-                   config: Optional[Config] = None) -> transforms.Compose:
-    """Build the image transformation pipeline.
+class VinDrCXRDataset(Dataset):
+    """VinDr-CXR dataset with majority-vote label construction.
 
     Args:
-        train: If ``True``, applies data-augmentation transforms.
-               If ``False``, applies inference-only transforms.
-        image_size: Target spatial resolution (square).
-        config: ``Config`` instance. Uses default ``Config()`` if ``None``.
+        csv_path: Path to train.csv or test.csv.
+        img_dir: Directory containing PNG and/or DICOM images.
+        labels: List of diagnosis labels used for training.
+        transform: Optional image transform pipeline.
+        split: Dataset split name, either "train" or "test".
+        vote_thresh: Minimum number of radiologists that must agree.
 
     Returns:
-        A :class:`torchvision.transforms.Compose` pipeline.
-    """
-    if config is None:
-        config = Config()
+        None.
 
-    imagenet_mean = [0.485, 0.456, 0.406]
-    imagenet_std  = [0.229, 0.224, 0.225]
-
-    if train:
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(degrees=config.ROTATION_DEGREES),
-            transforms.ColorJitter(
-                brightness=config.BRIGHTNESS_JITTER,
-                contrast=config.CONTRAST_JITTER,
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        ])
-    else:
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
-        ])
-
-
-# ─── CheXpert Dataset ─────────────────────────────────────────────────────────
-
-class CheXpertDataset(Dataset):
-    """PyTorch Dataset for CheXpert v1.0-small (frontal images only).
-
-    Handles the uncertain label policy (``-1`` → ``0`` for "zeros" policy)
-    and filters lateral views.
-
-    Args:
-        csv_path: Path to the CheXpert ``train.csv`` or ``valid.csv``.
-        img_root: Root directory that contains the raw image files.
-        transform: Optional torchvision transform pipeline.
-        label_names: List of 14 label column names.
-        uncertain_policy: How to handle ``-1`` labels.
-                          ``"zeros"`` → replace with ``0``.
+    Raises:
+        ValueError: If split is not "train" or "test".
+        FileNotFoundError: If input csv_path is missing.
     """
 
-    def __init__(
-        self,
-        csv_path: str,
-        img_root: str,
-        transform: Optional[transforms.Compose] = None,
-        label_names: Optional[List[str]] = None,
-        uncertain_policy: str = "zeros",
-    ) -> None:
-        super().__init__()
-        if label_names is None:
-            label_names = Config().CHEXPERT_LABELS
-
-        self.img_root = img_root
-        self.transform = transform
-        self.label_names = label_names
-        self.uncertain_policy = uncertain_policy
-
-        df = pd.read_csv(csv_path)
-
-        # Keep only frontal-view images
-        df = df[df["Path"].str.contains("frontal", case=False, na=False)].reset_index(drop=True)
-
-        # Resolve uncertain labels
-        if uncertain_policy == "zeros":
-            df[label_names] = df[label_names].replace(-1, 0)
-
-        # Fill remaining NaN with 0
-        df[label_names] = df[label_names].fillna(0)
-
-        self.df = df
-
-    def __len__(self) -> int:
-        """Return the total number of samples in the dataset.
-
-        Returns:
-            Integer number of samples.
-        """
-        return len(self.df)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load and transform a single sample.
-
-        Args:
-            idx: Index of the sample to load.
-
-        Returns:
-            Tuple of ``(image_tensor, label_tensor)`` where:
-            - ``image_tensor`` has shape ``(3, H, W)`` and dtype ``float32``
-            - ``label_tensor`` has shape ``(14,)`` and dtype ``float32``
-        """
-        row = self.df.iloc[idx]
-
-        # Construct absolute image path
-        img_path = os.path.join(self.img_root, row["Path"])
-        image = Image.open(img_path).convert("RGB")
-
-        if self.transform is not None:
-            image = self.transform(image)
-
-        label = torch.tensor(row[self.label_names].values.astype(np.float32),
-                             dtype=torch.float32)
-        return image, label
-
-
-# ─── NIH ChestX-ray14 Dataset ─────────────────────────────────────────────────
-
-class NIHDataset(Dataset):
-    """PyTorch Dataset for the NIH ChestX-ray14 dataset.
-
-    Parses the pipe-separated ``Finding Labels`` column into a binary
-    multi-hot label vector.
-
-    Args:
-        csv_path: Path to ``Data_Entry_2017.csv``.
-        img_dir: Directory containing image files.
-        transform: Optional torchvision transform pipeline.
-        label_names: List of 14 finding label names (NIH order).
-    """
+    _label_cache: Dict[Tuple[str, str, int, Tuple[str, ...]], pd.DataFrame] = {}
 
     def __init__(
         self,
         csv_path: str,
         img_dir: str,
-        transform: Optional[transforms.Compose] = None,
-        label_names: Optional[List[str]] = None,
+        labels: List[str],
+        transform: Optional[transforms.Compose],
+        split: str,
+        vote_thresh: int,
     ) -> None:
         super().__init__()
-        if label_names is None:
-            label_names = Config().NIH_LABELS
+        if split not in {"train", "test"}:
+            raise ValueError("split must be either 'train' or 'test'.")
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
 
+        self.csv_path = csv_path
         self.img_dir = img_dir
+        self.labels = labels
         self.transform = transform
-        self.label_names = label_names
+        self.split = split
+        self.vote_thresh = vote_thresh
 
-        df = pd.read_csv(csv_path)
+        self.label_df = self._build_label_df()
+        self.image_ids = self.label_df["image_id"].tolist()
 
-        # Build binary label matrix from pipe-separated finding labels
-        def _parse_labels(finding_str: str) -> List[float]:
-            findings = [f.strip() for f in str(finding_str).split("|")]
-            return [1.0 if lbl in findings else 0.0 for lbl in label_names]
+    def _build_label_df(self) -> pd.DataFrame:
+        """Builds a one-row-per-image binary label table.
 
-        labels_matrix = np.array(
-            df["Finding Labels"].apply(_parse_labels).tolist(),
-            dtype=np.float32,
-        )
-        self.image_names: List[str] = df["Image Index"].tolist()
-        self.labels: np.ndarray = labels_matrix
-
-    def __len__(self) -> int:
-        """Return the total number of samples.
+        Args:
+            None.
 
         Returns:
-            Integer number of samples.
+            A dataframe with columns ["image_id"] + labels.
+
+        Raises:
+            ValueError: If required csv columns are missing.
         """
-        return len(self.image_names)
+
+        cache_key = (
+            self.csv_path,
+            self.split,
+            self.vote_thresh,
+            tuple(self.labels),
+        )
+        if cache_key in VinDrCXRDataset._label_cache:
+            return VinDrCXRDataset._label_cache[cache_key].copy()
+
+        df = pd.read_csv(self.csv_path)
+        required_cols = {"image_id", "class_name"}
+        missing = required_cols.difference(df.columns)
+        if missing:
+            raise ValueError(
+                f"Missing required columns in {self.csv_path}: {sorted(missing)}"
+            )
+
+        image_ids = pd.DataFrame({"image_id": sorted(df["image_id"].astype(str).unique())})
+
+        if self.split == "train":
+            if "rad_id" not in df.columns:
+                raise ValueError(
+                    "Train CSV must include a 'rad_id' column for majority voting."
+                )
+
+            present_df = df[df["class_name"].isin(self.labels)].copy()
+            present_df = present_df[["image_id", "rad_id", "class_name"]]
+            present_df = present_df.drop_duplicates()
+            vote_counts = (
+                present_df.groupby(["image_id", "class_name"])["rad_id"]
+                .nunique()
+                .unstack(fill_value=0)
+            )
+
+            label_df = image_ids.copy()
+            for label in self.labels:
+                counts = vote_counts[label] if label in vote_counts.columns else 0
+                if isinstance(counts, int):
+                    label_df[label] = 0.0
+                else:
+                    label_df[label] = (
+                        label_df["image_id"].map(counts).fillna(0) >= self.vote_thresh
+                    ).astype(np.float32)
+        else:
+            if set(self.labels).issubset(df.columns):
+                label_df = df[["image_id"] + self.labels].copy()
+                for label in self.labels:
+                    label_df[label] = (label_df[label].fillna(0) > 0).astype(np.float32)
+            else:
+                present_df = df[df["class_name"].isin(self.labels)][["image_id", "class_name"]]
+                present_df = present_df.drop_duplicates()
+                consensus = (
+                    present_df.assign(value=1.0)
+                    .pivot(index="image_id", columns="class_name", values="value")
+                    .fillna(0.0)
+                )
+                label_df = image_ids.copy()
+                for label in self.labels:
+                    values = consensus[label] if label in consensus.columns else 0
+                    if isinstance(values, int):
+                        label_df[label] = 0.0
+                    else:
+                        label_df[label] = label_df["image_id"].map(values).fillna(0.0)
+
+        label_df["image_id"] = label_df["image_id"].astype(str)
+        for label in self.labels:
+            label_df[label] = label_df[label].astype(np.float32)
+
+        VinDrCXRDataset._label_cache[cache_key] = label_df.copy()
+        return label_df
+
+    def _resolve_image_path(self, image_id: str) -> str:
+        """Resolve image path for an image id.
+
+        Args:
+            image_id: VinDr image id without extension.
+
+        Returns:
+            The absolute path to an existing image file.
+
+        Raises:
+            FileNotFoundError: If no image file is found.
+        """
+
+        candidates = [
+            os.path.join(self.img_dir, image_id),
+            os.path.join(self.img_dir, f"{image_id}.png"),
+            os.path.join(self.img_dir, f"{image_id}.jpg"),
+            os.path.join(self.img_dir, f"{image_id}.jpeg"),
+            os.path.join(self.img_dir, f"{image_id}.dcm"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(f"No image found for image_id={image_id} in {self.img_dir}")
+
+    def _load_image(self, image_id: str) -> Image.Image:
+        """Load PNG/JPG/DICOM image and convert to RGB PIL format.
+
+        Args:
+            image_id: VinDr image id without extension.
+
+        Returns:
+            A PIL RGB image.
+
+        Raises:
+            FileNotFoundError: If the image file does not exist.
+        """
+
+        path = self._resolve_image_path(image_id)
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext in {".png", ".jpg", ".jpeg"}:
+            return Image.open(path).convert("RGB")
+
+        if ext == ".dcm" or ext == "":
+            dcm = pydicom.dcmread(path)
+            array = dcm.pixel_array.astype(np.float32)
+            array -= array.min()
+            max_val = float(array.max())
+            if max_val > 0:
+                array /= max_val
+            array = (array * 255.0).clip(0, 255).astype(np.uint8)
+
+            if array.ndim == 2:
+                rgb = np.stack([array, array, array], axis=-1)
+            elif array.ndim == 3 and array.shape[-1] == 3:
+                rgb = array
+            elif array.ndim == 3 and array.shape[0] == 3:
+                rgb = np.transpose(array, (1, 2, 0))
+            else:
+                gray = array.squeeze()
+                rgb = np.stack([gray, gray, gray], axis=-1)
+            return Image.fromarray(rgb).convert("RGB")
+
+        return Image.open(path).convert("RGB")
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load and transform a single sample.
+        """Get one sample as tensor pair.
 
         Args:
             idx: Sample index.
 
         Returns:
-            Tuple ``(image_tensor, label_tensor)``:
-            - ``image_tensor``: ``(3, H, W)`` float32 tensor
-            - ``label_tensor``: ``(14,)`` float32 binary vector
+            Tuple of (image_tensor, label_tensor_float32).
+
+        Raises:
+            IndexError: If idx is outside dataset range.
         """
-        img_path = os.path.join(self.img_dir, self.image_names[idx])
-        image = Image.open(img_path).convert("RGB")
 
+        if idx < 0 or idx >= len(self.image_ids):
+            raise IndexError(f"Index out of range: {idx}")
+
+        image_id = self.image_ids[idx]
+        image = self._load_image(image_id)
         if self.transform is not None:
-            image = self.transform(image)
+            image_tensor = self.transform(image)
+        else:
+            image_tensor = transforms.ToTensor()(image)
 
-        label = torch.tensor(self.labels[idx], dtype=torch.float32)
-        return image, label
+        labels = self.label_df.iloc[idx][self.labels].to_numpy(dtype=np.float32)
+        label_tensor = torch.tensor(labels, dtype=torch.float32)
+        return image_tensor, label_tensor
 
+    def __len__(self) -> int:
+        """Return the number of items.
 
-# ─── Stratified Subset ────────────────────────────────────────────────────────
+        Args:
+            None.
 
-def get_stratified_subset(dataset: Dataset, frac: float, seed: int) -> Subset:
-    """Return a stratified subset of a dataset.
+        Returns:
+            Number of samples in this split.
 
-    Uses ``StratifiedShuffleSplit`` from scikit-learn. The stratification
-    key is the argmax of each sample's multi-hot label vector (proxy for
-    the dominant pathology).
+        Raises:
+            None.
+        """
 
-    Args:
-        dataset: Full PyTorch ``Dataset`` whose ``__getitem__`` returns
-                 ``(image, label_tensor)``.
-        frac: Fraction of dataset to retain (e.g. ``0.20``).
-        seed: Random seed for reproducibility.
-
-    Returns:
-        A :class:`torch.utils.data.Subset` containing *frac* of the
-        original samples with preserved class distribution.
-    """
-    total = len(dataset)  # type: ignore[arg-type]
-
-    # Collect all labels to build stratification key
-    all_labels = []
-    for i in range(total):
-        _, label = dataset[i]  # type: ignore[index]
-        all_labels.append(label.numpy() if isinstance(label, torch.Tensor) else label)
-    all_labels_array = np.array(all_labels)
-
-    # Argmax as proxy stratify key for multi-label
-    strat_keys = np.argmax(all_labels_array, axis=1)
-
-    splitter = StratifiedShuffleSplit(
-        n_splits=1, test_size=frac, random_state=seed
-    )
-    _, subset_indices = next(
-        splitter.split(np.zeros(total), strat_keys)
-    )
-
-    logger.info(
-        "Subset: %d / %d samples (%.0f%%)",
-        len(subset_indices), total, frac * 100,
-    )
-    print(f"Subset: {len(subset_indices)} / {total} samples ({frac * 100:.0f}%)")
-
-    return Subset(dataset, subset_indices.tolist())
+        return len(self.image_ids)
 
 
-# ─── DataLoader Builder ───────────────────────────────────────────────────────
-
-def build_dataloaders(
-    dataset_name: str,
-    config: Config,
-    seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Build stratified subset dataloaders for a given dataset.
-
-    1. Instantiates the full dataset with augmented + non-augmented transforms.
-    2. Applies ``get_stratified_subset`` (``SUBSET_FRAC = 0.20``).
-    3. Splits the subset into train / val / test (70 / 15 / 15).
+def get_transforms(train: bool, image_size: int) -> transforms.Compose:
+    """Build train/eval image preprocessing transforms.
 
     Args:
-        dataset_name: One of ``"chexpert"`` or ``"nih"``.
-        config: ``Config`` instance containing all hyperparameters and paths.
-        seed: Random seed forwarded to the subset sampler and generators.
+        train: Whether to return augmentation pipeline.
+        image_size: Output spatial size.
 
     Returns:
-        Tuple ``(train_loader, val_loader, test_loader)`` — three
-        :class:`torch.utils.data.DataLoader` instances.
+        A torchvision transform composition.
 
     Raises:
-        ValueError: If ``dataset_name`` is not ``"chexpert"`` or ``"nih"``.
+        None.
     """
-    train_tf = get_transforms(train=True,  image_size=config.IMAGE_SIZE, config=config)
-    eval_tf  = get_transforms(train=False, image_size=config.IMAGE_SIZE, config=config)
 
-    if dataset_name == "chexpert":
-        full_train = CheXpertDataset(
-            csv_path=config.CHEXPERT_CSV,
-            img_root=config.CHEXPERT_DIR,
-            transform=train_tf,
-            label_names=config.CHEXPERT_LABELS,
-            uncertain_policy=config.UNCERTAIN_POLICY,
-        )
-        full_eval = CheXpertDataset(
-            csv_path=config.CHEXPERT_CSV,
-            img_root=config.CHEXPERT_DIR,
-            transform=eval_tf,
-            label_names=config.CHEXPERT_LABELS,
-            uncertain_policy=config.UNCERTAIN_POLICY,
-        )
-    elif dataset_name == "nih":
-        full_train = NIHDataset(  # type: ignore[assignment]
-            csv_path=config.NIH_CSV,
-            img_dir=config.NIH_DIR,
-            transform=train_tf,
-            label_names=config.NIH_LABELS,
-        )
-        full_eval = NIHDataset(   # type: ignore[assignment]
-            csv_path=config.NIH_CSV,
-            img_dir=config.NIH_DIR,
-            transform=eval_tf,
-            label_names=config.NIH_LABELS,
-        )
-    else:
-        raise ValueError(f"Unknown dataset_name: '{dataset_name}'. Use 'chexpert' or 'nih'.")
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    if train:
+        return transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
 
-    # Stratified 20% subset (using training-augmented dataset for indices)
-    subset = get_stratified_subset(full_eval, frac=config.SUBSET_FRAC, seed=seed)
 
-    n_total  = len(subset)  # type: ignore[arg-type]
-    n_train  = int(0.70 * n_total)
-    n_val    = int(0.15 * n_total)
-    n_test   = n_total - n_train - n_val
+def build_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Build train/val/test dataloaders for VinDr-CXR.
 
-    generator = torch.Generator().manual_seed(seed)
-    train_sub, val_sub, test_sub = random_split(
-        subset, [n_train, n_val, n_test], generator=generator
+    Args:
+        config: Global project config.
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader).
+
+    Raises:
+        ValueError: If validation split is invalid.
+    """
+
+    if not 0.0 < config.VAL_SPLIT < 1.0:
+        raise ValueError("VAL_SPLIT must be in (0, 1).")
+
+    train_tf = get_transforms(train=True, image_size=config.IMAGE_SIZE)
+    eval_tf = get_transforms(train=False, image_size=config.IMAGE_SIZE)
+
+    train_dataset_aug = VinDrCXRDataset(
+        csv_path=config.TRAIN_CSV,
+        img_dir=config.TRAIN_IMG_DIR,
+        labels=config.LABELS,
+        transform=train_tf,
+        split="train",
+        vote_thresh=config.MAJORITY_VOTE_THRESHOLD,
+    )
+    train_dataset_eval = VinDrCXRDataset(
+        csv_path=config.TRAIN_CSV,
+        img_dir=config.TRAIN_IMG_DIR,
+        labels=config.LABELS,
+        transform=eval_tf,
+        split="train",
+        vote_thresh=config.MAJORITY_VOTE_THRESHOLD,
     )
 
-    # Swap the eval dataset's indices for training set
-    # (train_sub should use augmented transforms)
-    # Re-wrap train indices with augmented dataset directly:
-    train_indices = [subset.indices[i] for i in train_sub.indices]  # type: ignore[attr-defined]
-    val_indices   = [subset.indices[i] for i in val_sub.indices]    # type: ignore[attr-defined]
-    test_indices  = [subset.indices[i] for i in test_sub.indices]   # type: ignore[attr-defined]
+    n_total = len(train_dataset_aug)
+    n_val = int(round(n_total * config.VAL_SPLIT))
+    n_val = max(1, min(n_val, n_total - 1))
+    n_train = n_total - n_val
 
-    train_subset = Subset(full_train, train_indices)
-    val_subset   = Subset(full_eval,  val_indices)
-    test_subset  = Subset(full_eval,  test_indices)
+    seed = config.SEEDS[0] if config.SEEDS else 42
+    split_generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(n_total, generator=split_generator).tolist()
+    train_indices = permutation[:n_train]
+    val_indices = permutation[n_train:]
 
+    train_subset = Subset(train_dataset_aug, train_indices)
+    val_subset = Subset(train_dataset_eval, val_indices)
+
+    test_dataset = VinDrCXRDataset(
+        csv_path=config.TEST_CSV,
+        img_dir=config.TEST_IMG_DIR,
+        labels=config.LABELS,
+        transform=eval_tf,
+        split="test",
+        vote_thresh=config.MAJORITY_VOTE_THRESHOLD,
+    )
+
+    loader_generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
         train_subset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
         pin_memory=True,
-        generator=torch.Generator().manual_seed(seed),
+        generator=loader_generator,
     )
     val_loader = DataLoader(
         val_subset,
@@ -361,13 +359,14 @@ def build_dataloaders(
         shuffle=False,
         num_workers=config.NUM_WORKERS,
         pin_memory=True,
+        generator=torch.Generator().manual_seed(seed),
     )
     test_loader = DataLoader(
-        test_subset,
+        test_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
         pin_memory=True,
+        generator=torch.Generator().manual_seed(seed),
     )
-
     return train_loader, val_loader, test_loader

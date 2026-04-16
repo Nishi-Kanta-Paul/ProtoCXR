@@ -1,237 +1,188 @@
-"""
-src/explainability.py
-=====================
-Prototype explanation pipeline and publication-quality visualisations.
-
-Provides:
-  - get_prototype_explanation  : Extract explanation dict for one image.
-  - visualize_explanation      : 3-panel figure (original / heatmap / prototype).
-  - find_nearest_training_patches : Dataset-wide nearest-patch search.
-"""
+"""Explainability helpers for ProtoCXR."""
 
 import os
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.config import Config
 from src.model import ProtoCXR
 
-matplotlib.rcParams["font.family"] = "serif"
-
-
-# ─── Prototype Explanation Extractor ─────────────────────────────────────────
 
 def get_prototype_explanation(
     model: ProtoCXR,
     image_tensor: torch.Tensor,
     class_idx: int,
     device: torch.device,
-) -> Dict:
-    """Extract an interpretable explanation for a single image–class pair.
+) -> Dict[str, object]:
+    """Compute a prototype explanation for one image and class.
 
     Args:
-        model:        Trained :class:`~src.model.ProtoCXR` model.
-        image_tensor: Image tensor of shape ``(1, 3, H, W)`` on CPU or device.
-        class_idx:    Class index to explain.
-        device:       Compute device.
+        model: Trained ProtoCXR model.
+        image_tensor: Input image tensor shaped (1, 3, 224, 224).
+        class_idx: Class index to explain.
+        device: Active device.
 
     Returns:
-        Dictionary with the following keys:
+        Dictionary with proto_idx, class_idx, sim_score, spatial_map,
+        activation_upsampled, and proto_vector.
 
-        - ``proto_idx`` (int): Index of the most-activated prototype.
-        - ``class_idx`` (int): The requested class index.
-        - ``sim_score`` (float): Peak similarity value for the top prototype.
-        - ``spatial_map`` (ndarray, shape ``(7, 7)``): Raw similarity map.
-        - ``proto_vector`` (ndarray, shape ``(D,)``): Prototype embedding.
-        - ``activation_upsampled`` (ndarray, shape ``(224, 224)``): Bilinearly
-          upsampled similarity map for overlay visualisation.
+    Raises:
+        ValueError: If image_tensor does not have batch size 1.
     """
+
+    if image_tensor.shape[0] != 1:
+        raise ValueError("image_tensor must have shape (1, 3, H, W).")
+
     model.eval()
-    x = image_tensor.to(device)
-
     with torch.no_grad():
-        explanation = model.get_explanation(x, class_idx)
+        explanation = model.get_explanation(image_tensor.to(device), class_idx)
 
-    spatial_map = explanation["spatial_map"]           # Tensor (H, W)
-    # Bilinear upsample to full image resolution
-    up = F.interpolate(
-        spatial_map.unsqueeze(0).unsqueeze(0).float(),
+    spatial_map = explanation["spatial_map"].detach().cpu().float()
+    activation_upsampled = F.interpolate(
+        spatial_map.unsqueeze(0).unsqueeze(0),
         size=(224, 224),
         mode="bilinear",
         align_corners=False,
-    ).squeeze().cpu().numpy()
+    ).squeeze(0).squeeze(0)
 
     return {
-        "proto_idx":           explanation["proto_idx"],
-        "class_idx":           class_idx,
-        "sim_score":           explanation["sim_score"],
-        "spatial_map":         spatial_map.cpu().numpy(),
-        "proto_vector":        explanation["proto_vector"].cpu().numpy(),
-        "activation_upsampled": up,
+        "proto_idx": int(explanation["proto_idx"]),
+        "class_idx": int(class_idx),
+        "sim_score": float(explanation["sim_score"]),
+        "spatial_map": spatial_map.numpy(),
+        "activation_upsampled": activation_upsampled.cpu().numpy(),
+        "proto_vector": explanation["proto_vector"].detach().cpu().numpy(),
     }
 
 
-# ─── Explanation Visualisation ────────────────────────────────────────────────
-
 def visualize_explanation(
     image_np: np.ndarray,
-    explanation_dict: Dict,
+    explanation: Dict[str, object],
     class_name: str,
     save_path: Optional[str] = None,
-    config: Optional[Config] = None,
 ) -> plt.Figure:
-    """Create a 3-panel publication figure for one prototype explanation.
-
-    Panels:
-        1. Original CXR image
-        2. Similarity activation heatmap overlaid on image (viridis, α=0.5)
-        3. Spatial similarity map thumbnail (7×7 upsampled)
-
-    No title text is placed inside the figure bounds.
+    """Create 3-panel explanation figure.
 
     Args:
-        image_np:         Image as ``(H, W, 3)`` float or uint8 ndarray.
-        explanation_dict: Output of :func:`get_prototype_explanation`.
-        class_name:       String label name (used for annotation, not title).
-        save_path:        If given, save the figure to this path as PNG.
-        config:           ``Config`` for DPI and font settings. Uses defaults
-                          if ``None``.
+        image_np: Input image array shaped (H, W) or (H, W, 3).
+        explanation: Dictionary returned by get_prototype_explanation.
+        class_name: Human-readable class name.
+        save_path: Optional save path for PNG output.
 
     Returns:
-        Matplotlib :class:`~matplotlib.figure.Figure` object.
+        Matplotlib figure object.
+
+    Raises:
+        ValueError: If prototype vector cannot be reshaped to 16x32.
     """
-    if config is None:
-        config = Config()
 
-    _apply_style(config)
+    del class_name
+    image = image_np.astype(np.float32)
+    if image.max() > 1.0:
+        image = image / 255.0
 
-    sim_score   = explanation_dict["sim_score"]
-    heatmap     = explanation_dict["activation_upsampled"]     # (224, 224)
-    spatial_map = explanation_dict["spatial_map"]              # (7, 7)
+    heatmap = np.asarray(explanation["activation_upsampled"], dtype=np.float32)
+    sim_score = float(explanation["sim_score"])
+    proto_idx = int(explanation["proto_idx"])
+    proto_vector = np.asarray(explanation["proto_vector"], dtype=np.float32)
 
-    # Normalise image to [0, 1] for display
-    img_display = image_np.astype(np.float32)
-    if img_display.max() > 1.0:
-        img_display /= 255.0
+    if proto_vector.size != 16 * 32:
+        raise ValueError("Expected prototype vector dimension 512 for 16x32 reshape.")
+    proto_grid = proto_vector.reshape(16, 32)
 
-    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.5))
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3), facecolor="white")
 
-    # Panel 1 — Original image
-    axes[0].imshow(img_display, cmap="gray" if img_display.ndim == 2 else None)
+    # Panel 1: Original image.
+    if image.ndim == 2:
+        axes[0].imshow(image, cmap="gray")
+    else:
+        axes[0].imshow(image)
     axes[0].axis("off")
 
-    # Panel 2 — Heatmap overlay
-    axes[1].imshow(img_display, cmap="gray" if img_display.ndim == 2 else None)
-    axes[1].imshow(heatmap, cmap="viridis", alpha=0.5,
-                   vmin=heatmap.min(), vmax=heatmap.max())
+    # Panel 2: Overlayed heatmap.
+    if image.ndim == 2:
+        axes[1].imshow(image, cmap="gray")
+    else:
+        axes[1].imshow(image)
+    axes[1].imshow(heatmap, cmap="viridis", alpha=0.4)
     axes[1].text(
-        0.97, 0.03, f"sim = {sim_score:.2f}",
+        0.98,
+        0.02,
+        f"sim = {sim_score:.2f}",
         transform=axes[1].transAxes,
-        ha="right", va="bottom",
-        fontsize=8, color="white",
-        bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
+        ha="right",
+        va="bottom",
+        color="white",
+        fontsize=9,
+        bbox={"facecolor": "black", "alpha": 0.5, "pad": 3},
     )
     axes[1].axis("off")
 
-    # Panel 3 — Prototype spatial map thumbnail
-    axes[2].imshow(spatial_map, cmap="viridis", aspect="auto")
-    axes[2].axis("off")
+    # Panel 3: Prototype vector visualization.
+    axes[2].imshow(proto_grid, cmap="viridis", aspect="auto")
+    axes[2].set_xlabel(f"Prototype #{proto_idx}")
+    axes[2].set_xticks([])
+    axes[2].set_yticks([])
 
-    for ax in axes:
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    plt.tight_layout(pad=0.4)
-
+    fig.tight_layout()
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(
-            save_path,
-            dpi=config.FIG_DPI,
-            bbox_inches="tight",
-            facecolor="white",
-        )
+        fig.savefig(save_path, dpi=180, bbox_inches="tight", facecolor="white")
     return fig
 
 
-# ─── Nearest Training Patches ────────────────────────────────────────────────
-
-def find_nearest_training_patches(
+def find_nearest_patches(
     model: ProtoCXR,
     dataloader: DataLoader,
     device: torch.device,
     n_top: int = 5,
-) -> Dict[int, List[Tuple]]:
-    """Find the top-N most similar training patches for each prototype.
-
-    Useful for prototype push visualisation and paper figure generation.
+) -> Dict[int, List[Tuple[torch.Tensor, Tuple[int, int], float]]]:
+    """Find top-N nearest patches for each prototype.
 
     Args:
-        model:      :class:`~src.model.ProtoCXR` model (features_only mode).
-        dataloader: Training DataLoader (images, labels).
-        device:     Compute device.
-        n_top:      Number of top patches per prototype.
+        model: Trained ProtoCXR model.
+        dataloader: Dataloader over training images.
+        device: Active device.
+        n_top: Number of nearest patches per prototype.
 
     Returns:
-        Dictionary ``{proto_idx: [(patch_flat_idx, sim_score), ...]}``.
-        ``patch_flat_idx`` encodes ``(batch_start_sample_idx, spatial_row, spatial_col)``.
+        Mapping from prototype index to list of tuples:
+        (image_tensor, spatial_position, similarity_score).
+
+    Raises:
+        None.
     """
+
     model.eval()
-    total_proto = model.num_classes * model.num_proto
-
-    # Top-N heap: list of (neg_sim, info) for min-heap behaviour
-    top_lists: Dict[int, List[Tuple]] = {k: [] for k in range(total_proto)}
-
-    sample_offset = 0
+    result: Dict[int, List[Tuple[torch.Tensor, Tuple[int, int], float]]] = {
+        proto_idx: [] for proto_idx in range(model.total_proto)
+    }
 
     with torch.no_grad():
         for images, _ in dataloader:
             images = images.to(device, non_blocking=True)
-            feat_list = model.backbone(images)
-            features  = model.proj(feat_list[-1])              # (B, D, H, W)
-            B, D, H, W = features.shape
+            _, sim_maps, _ = model(images, return_sim_maps=True)
 
-            sim_maps = model.sim_fn(features, model.prototypes)  # (B, P, H, W)
+            batch_size, _, height, width = sim_maps.shape
+            for proto_idx in range(model.total_proto):
+                scores = sim_maps[:, proto_idx].reshape(batch_size, height * width)
+                flat_scores = scores.reshape(-1)
+                k_val = min(n_top, flat_scores.numel())
+                top_scores, top_indices = torch.topk(flat_scores, k=k_val)
 
-            for b in range(B):
-                for k in range(total_proto):
-                    for i in range(H):
-                        for j in range(W):
-                            score = sim_maps[b, k, i, j].item()
-                            info  = (sample_offset + b, i, j, score)
-                            top_lists[k].append(info)
+                for score, flat_idx in zip(top_scores.tolist(), top_indices.tolist()):
+                    img_pos = flat_idx // (height * width)
+                    spatial = flat_idx % (height * width)
+                    row = spatial // width
+                    col = spatial % width
+                    entry = (images[img_pos].detach().cpu(), (int(row), int(col)), float(score))
+                    result[proto_idx].append(entry)
 
-            sample_offset += B
+    for proto_idx in result:
+        result[proto_idx] = sorted(result[proto_idx], key=lambda item: item[2], reverse=True)[:n_top]
 
-    # For each prototype, keep top-N by sim_score
-    for k in range(total_proto):
-        top_lists[k] = sorted(top_lists[k], key=lambda x: -x[3])[:n_top]
-
-    return top_lists
-
-
-# ─── Internal helper ─────────────────────────────────────────────────────────
-
-def _apply_style(config: Config) -> None:
-    """Apply global matplotlib style settings from config.
-
-    Args:
-        config: ``Config`` instance.
-    """
-    plt.rcParams.update({
-        "font.family":       config.FIG_FONT,
-        "font.size":         10,
-        "axes.spines.top":   False,
-        "axes.spines.right": False,
-        "axes.linewidth":    0.8,
-        "figure.facecolor":  "white",
-        "axes.facecolor":    "white",
-        "xtick.major.size":  3,
-        "ytick.major.size":  3,
-    })
+    return result

@@ -1,12 +1,11 @@
-"""
-src/inference.py
-================
-Run ProtoCXR on new CXR images and output predictions + explanations.
-"""
+"""Inference utilities for ProtoCXR."""
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pydicom
 import torch
 from PIL import Image
 
@@ -17,27 +16,62 @@ from src.model import ProtoCXR
 from src.utils import save_json
 
 
-def load_model(checkpoint_path: str, config: Config, device: torch.device) -> ProtoCXR:
-    """Load a trained ProtoCXR from a checkpoint file.
+def _load_image(image_path: str) -> Image.Image:
+    """Load PNG/JPG/DICOM image and return RGB PIL image.
 
     Args:
-        checkpoint_path: Path to the ``.pt`` checkpoint file.
-        config:          ``Config`` instance used to instantiate the model.
-        device:          Compute device.
+        image_path: Input image path.
 
     Returns:
-        Loaded :class:`~src.model.ProtoCXR` in ``eval`` mode.
+        PIL RGB image.
+
+    Raises:
+        FileNotFoundError: If input path does not exist.
     """
-    model = ProtoCXR(
-        num_classes=config.NUM_CLASSES,
-        num_proto=config.NUM_PROTO,
-        feat_dim=config.FEAT_DIM,
-        backbone_name=config.BACKBONE,
-        backbone_pretrained=False,
-    )
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state.get("model_state_dict", state))
-    model.to(device)
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in {".png", ".jpg", ".jpeg"}:
+        return Image.open(image_path).convert("RGB")
+
+    dcm = pydicom.dcmread(image_path)
+    array = dcm.pixel_array.astype(np.float32)
+    array -= array.min()
+    max_val = float(array.max())
+    if max_val > 0:
+        array /= max_val
+    array = (array * 255.0).clip(0, 255).astype(np.uint8)
+    if array.ndim == 2:
+        array = np.stack([array, array, array], axis=-1)
+    elif array.ndim == 3 and array.shape[0] == 3:
+        array = np.transpose(array, (1, 2, 0))
+    return Image.fromarray(array).convert("RGB")
+
+
+def load_model(checkpoint_path: str, config: Config, device: torch.device) -> ProtoCXR:
+    """Build ProtoCXR from config and load checkpoint weights.
+
+    Args:
+        checkpoint_path: Path to checkpoint file.
+        config: Global model config.
+        device: Active device.
+
+    Returns:
+        Loaded model in eval mode.
+
+    Raises:
+        FileNotFoundError: If checkpoint path is missing.
+    """
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    model = ProtoCXR(config).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state = checkpoint.get("model_state", checkpoint)
+    model.load_state_dict(state)
     model.eval()
     return model
 
@@ -47,55 +81,42 @@ def predict(
     image_path: str,
     config: Config,
     device: torch.device,
-    label_names: List[str],
     threshold: float = 0.5,
-) -> Dict:
-    """Run inference and generate explanations for a single image.
+) -> Dict[str, object]:
+    """Run single-image inference with prototype explanations.
 
     Args:
-        model:       Trained :class:`~src.model.ProtoCXR` in eval mode.
-        image_path:  Path to the input CXR image (PNG/JPEG)
-        config:      ``Config`` instance.
-        device:      Compute device.
-        label_names: List of class labels corresponding to output logits.
-        threshold:   Probability threshold for a positive finding.
+        model: Trained ProtoCXR model.
+        image_path: Path to PNG/JPG/DICOM image.
+        config: Global config with label list.
+        device: Active device.
+        threshold: Positive-finding probability threshold.
 
     Returns:
-        Dictionary with keys:
+        Dict containing predictions, positive_findings, and explanations.
 
-        - ``"predictions"``: ``{label: probability}`` for all classes.
-        - ``"positive_findings"``: List of labels where prob > threshold.
-        - ``"explanations"``: ``{label: explanation_dict}`` for each
-          positive finding.
+    Raises:
+        None.
     """
-    image_pil = Image.open(image_path).convert("RGB")
-    transform = get_transforms(train=False, image_size=config.IMAGE_SIZE, config=config)
 
-    img_tensor = transform(image_pil).unsqueeze(0).to(device)
+    image = _load_image(image_path)
+    transform = get_transforms(train=False, image_size=config.IMAGE_SIZE)
+    image_tensor = transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        logits, _ = model(img_tensor, return_sim_maps=False)
-        probs = torch.sigmoid(logits).cpu().squeeze(0).numpy()
+        logits, _ = model(image_tensor, return_sim_maps=False)
+        probs = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
 
-    res_preds: Dict[str, float] = {}
-    positive_findings: List[str] = []
+    predictions = {label: float(probs[idx]) for idx, label in enumerate(config.LABELS)}
+    positive_findings = [label for label, prob in predictions.items() if prob > threshold]
 
-    for i, name in enumerate(label_names):
-        p = float(probs[i])
-        res_preds[name] = p
-        if p > threshold:
-            positive_findings.append(name)
-
-    explanations: Dict[str, Dict] = {}
-    for name in positive_findings:
-        class_idx = label_names.index(name)
-        exp = get_prototype_explanation(model, img_tensor, class_idx, device)
-        # convert numpy arrays to lists for JSON serialization
-        # or leave as dict if called internally (caller handles save)
-        explanations[name] = exp
+    explanations: Dict[str, Dict[str, object]] = {}
+    for label in positive_findings:
+        class_idx = config.LABELS.index(label)
+        explanations[label] = get_prototype_explanation(model, image_tensor, class_idx, device)
 
     return {
-        "predictions": res_preds,
+        "predictions": predictions,
         "positive_findings": positive_findings,
         "explanations": explanations,
     }
@@ -106,75 +127,73 @@ def batch_inference(
     image_dir: str,
     config: Config,
     device: torch.device,
-    label_names: List[str],
     save_dir: str,
 ) -> None:
-    """Run inference on all images in a directory.
-
-    Saves predictions to ``<save_dir>/predictions/<filename>.json``
-    and explanation figures to ``<save_dir>/explanations/<filename>_<label>.png``.
+    """Run inference for all images in a directory.
 
     Args:
-        model:       Trained :class:`~src.model.ProtoCXR`.
-        image_dir:   Path to directory containing input CXR images.
-        config:      ``Config`` instance.
-        device:      Compute device.
-        label_names: List of class labels (e.g. from CheXpert or NIH).
-        save_dir:    Output directory path.
+        model: Trained ProtoCXR model.
+        image_dir: Directory with image files.
+        config: Global config.
+        device: Active device.
+        save_dir: Root output directory.
+
+    Returns:
+        None.
+
+    Raises:
+        FileNotFoundError: If image_dir does not exist.
     """
-    valid_exts = {".png", ".jpg", ".jpeg"}
-    images = [f for f in os.listdir(image_dir) if os.path.splitext(f.lower())[1] in valid_exts]
 
-    if not images:
-        print(f"No valid images found in {image_dir}.")
-        return
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(f"Inference directory not found: {image_dir}")
 
-    pred_dir = os.path.join(save_dir, "predictions")
-    exp_dir  = os.path.join(save_dir, "explanations")
-    os.makedirs(pred_dir, exist_ok=True)
-    os.makedirs(exp_dir, exist_ok=True)
+    valid_ext = {".png", ".jpg", ".jpeg", ".dcm"}
+    files = [
+        name
+        for name in sorted(os.listdir(image_dir))
+        if os.path.splitext(name)[1].lower() in valid_ext
+    ]
 
-    print(f"Running inference on {len(images)} images from {image_dir}...")
+    predictions_dir = os.path.join(save_dir, "predictions")
+    explanations_dir = os.path.join(save_dir, "explanations")
+    os.makedirs(predictions_dir, exist_ok=True)
+    os.makedirs(explanations_dir, exist_ok=True)
 
-    # For mean calculation
-    class_prob_sums = {n: 0.0 for n in label_names}
+    finding_counter = {label: 0 for label in config.LABELS}
 
-    for filename in images:
+    for filename in files:
         path = os.path.join(image_dir, filename)
-        base = os.path.splitext(filename)[0]
+        image_id = os.path.splitext(filename)[0]
+        result = predict(model, path, config, device)
 
-        res = predict(model, path, config, device, label_names)
+        for finding in result["positive_findings"]:
+            finding_counter[finding] += 1
 
-        # Accumulate prob sums
-        for n in label_names:
-            class_prob_sums[n] += res["predictions"][n]
+        serializable_explanations: Dict[str, Dict[str, object]] = {}
+        image_np = np.asarray(_load_image(path).convert("RGB"))
 
-        # Save JSON (remove raw ndarrays from explanation dict for serialization)
-        json_payload = {
-            "file": filename,
-            "predictions": res["predictions"],
-            "positive_findings": res["positive_findings"],
-            "explanations": {}
-        }
-
-        for finding, exp in res["explanations"].items():
-            json_payload["explanations"][finding] = {
-                "proto_idx": exp["proto_idx"],
-                "sim_score": exp["sim_score"],
+        for label, explanation in result["explanations"].items():
+            serializable_explanations[label] = {
+                "proto_idx": int(explanation["proto_idx"]),
+                "class_idx": int(explanation["class_idx"]),
+                "sim_score": float(explanation["sim_score"]),
+                "spatial_map": np.asarray(explanation["spatial_map"]).tolist(),
+                "activation_upsampled": np.asarray(explanation["activation_upsampled"]).tolist(),
+                "proto_vector": np.asarray(explanation["proto_vector"]).tolist(),
             }
+            fig_path = os.path.join(explanations_dir, f"{image_id}_{label.replace(' ', '_')}.png")
+            figure = visualize_explanation(image_np, explanation, label, save_path=fig_path)
+            plt.close(figure)
 
-            # Visualize and save the explanation figure
-            img_np = __import__('numpy').array(Image.open(path).convert("RGB"))
-            fig_path = os.path.join(exp_dir, f"{base}_{finding.replace(' ', '_')}.png")
-            visualize_explanation(img_np, exp, finding, save_path=fig_path, config=config)
+        payload = {
+            "predictions": result["predictions"],
+            "positive_findings": result["positive_findings"],
+            "explanations": serializable_explanations,
+        }
+        save_json(payload, os.path.join(predictions_dir, f"{image_id}.json"))
 
-        save_json(json_payload, os.path.join(pred_dir, f"{base}.json"))
-
-    print("\nInference Summary")
-    print("-----------------")
-    print(f"Total processed: {len(images)}")
-    print("Mean Confidence per Class:")
-    for n in label_names:
-        avg = class_prob_sums[n] / len(images)
-        print(f"  - {n:<24}: {avg:.4f}")
-    print(f"\nOutputs saved to {save_dir}")
+    print(f"Total images: {len(files)}")
+    print("Findings per class:")
+    for label in config.LABELS:
+        print(f"  {label}: {finding_counter[label]}")
